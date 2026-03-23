@@ -2,8 +2,10 @@
 model_ddsp.py - DDSP Neural Vocoder
 
 Signal model:
-    audio(t) = Σ_k  A_k(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators]
-             + noise_STFT_shaped(t)                     [filtered noise]
+    L(t) = Σ_k  A_k_L(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, left]
+         + noise_STFT_shaped_L(t)                     [filtered noise, left]
+    R(t) = Σ_k  A_k_R(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, right]
+         + noise_STFT_shaped_R(t)                     [filtered noise, right]
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -150,6 +152,10 @@ class DDSPVocoder(nn.Module):
     """
     DDSP Neural Vocoder conditioned on (F0, loudness, velocity).
 
+    Fully stereo: independent harmonic amplitude profiles and noise filters
+    for L and R channels.  The model learns per-channel overtone balance
+    (e.g. piano string position, mic placement) directly from training data.
+
     Returns: (B, 2, n_samples) stereo audio.
     """
 
@@ -169,7 +175,9 @@ class DDSPVocoder(nn.Module):
             nn.Linear(gru_hidden, mlp_dim), nn.ReLU(),
         )
 
-        self.head_harm    = nn.Linear(mlp_dim, N_HARM)
+        # Independent harmonic amplitude profiles per channel
+        self.head_harm_L  = nn.Linear(mlp_dim, N_HARM)
+        self.head_harm_R  = nn.Linear(mlp_dim, N_HARM)
         self.head_amp     = nn.Linear(mlp_dim, 1)
         self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
         self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
@@ -197,18 +205,20 @@ class DDSPVocoder(nn.Module):
         feat, _ = self.gru(feat)
         feat    = self.post_mlp(feat)
 
-        harm_amps   = torch.sigmoid(self.head_harm(feat))
+        harm_amps_L = torch.sigmoid(self.head_harm_L(feat))
+        harm_amps_R = torch.sigmoid(self.head_harm_R(feat))
         overall_amp = F.softplus(self.head_amp(feat))
         noise_L     = torch.sigmoid(self.head_noise_L(feat))
         noise_R     = torch.sigmoid(self.head_noise_R(feat))
 
-        n_samples   = n_frames * FRAME_HOP
-        harmonic    = self.harm_synth(harm_amps, overall_amp, f0_hz, n_samples)
-        noise_sig_L = self.noise_synth(noise_L, n_samples)
-        noise_sig_R = self.noise_synth(noise_R, n_samples)
+        n_samples    = n_frames * FRAME_HOP
+        harmonic_L   = self.harm_synth(harm_amps_L, overall_amp, f0_hz, n_samples)
+        harmonic_R   = self.harm_synth(harm_amps_R, overall_amp, f0_hz, n_samples)
+        noise_sig_L  = self.noise_synth(noise_L, n_samples)
+        noise_sig_R  = self.noise_synth(noise_R, n_samples)
 
-        L = harmonic + noise_sig_L
-        R = harmonic + noise_sig_R
+        L = harmonic_L + noise_sig_L
+        R = harmonic_R + noise_sig_R
         return torch.cat([L, R], dim=1)   # (B, 2, n_samples)
 
 
