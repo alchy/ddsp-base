@@ -153,7 +153,7 @@ def build_ui():
                 def read_ext_status(instrument, workspace):
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
-                    work_dir  = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    work_dir  = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
                     ext_dir   = os.path.join(work_dir, 'extracts')
                     src_wavs  = len(glob.glob(os.path.join(instrument, '**', '*.wav'),
                                               recursive=True))
@@ -173,7 +173,7 @@ def build_ui():
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['extract', '--instrument', instrument, '--chunk-sec', str(int(chunk_s))]
-                    if workspace.strip(): args += ['--workspace', workspace.strip()]
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if fp: args.append('--force-pyin')
                     return run_command(args, ext_log)
 
@@ -205,7 +205,7 @@ def build_ui():
                 def read_ddsp_status(instrument, workspace):
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
-                    work_dir = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
                     best_pt  = os.path.join(work_dir, 'checkpoints', 'best.pt')
                     cfg_path = os.path.join(work_dir, 'instrument.json')
                     if not os.path.exists(best_pt):
@@ -266,12 +266,12 @@ def build_ui():
                     args = ['learn', '--instrument', instrument,
                             '--model', size, '--epochs', str(int(epochs)),
                             '--lr', f'{lr:.2e}']
-                    if workspace.strip(): args += ['--workspace', workspace.strip()]
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if resume: args.append('--resume')
                     return run_command(args, lrn_log)
 
                 def read_train_log(instrument, workspace):
-                    work_dir = workspace.strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
                     log_path = os.path.join(work_dir, 'train.log')
                     if not os.path.exists(log_path):
                         return '(train.log nenalezen)'
@@ -312,7 +312,7 @@ def build_ui():
                 def read_env_status(instrument, workspace):
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
-                    work_dir = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
                     env_pt   = os.path.join(work_dir, 'checkpoints', 'envelope.pt')
                     if not os.path.exists(env_pt):
                         return 'Nenatrenovano — envelope.pt neexistuje.'
@@ -376,7 +376,7 @@ def build_ui():
                             '--envelope-warp', f'{warp:.2f}',
                             '--n-env', str(int(n_env)),
                             '--attack-weight', f'{atk_w:.2f}']
-                    if workspace.strip(): args += ['--workspace', workspace.strip()]
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     return run_command(args, env_log)
 
                 env_run.click(fn=run_learn_envelope,
@@ -400,7 +400,7 @@ def build_ui():
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
                     name      = os.path.basename(instrument.rstrip('/\\'))
-                    out_dir   = output.strip() or os.path.join(ITHACA_ROOT, name)
+                    out_dir   = (output or '').strip() or os.path.join(ITHACA_ROOT, name)
                     wav_files = glob.glob(os.path.join(out_dir, '*.wav'))
                     n_wav     = len(wav_files)
                     if n_wav == 0:
@@ -478,7 +478,7 @@ def build_ui():
                     args = ['generate', '--instrument', instrument,
                             '--envelope-source', env_src,
                             '--attack-ramp-ms', str(int(atk_ramp))]
-                    if workspace.strip(): args += ['--workspace', workspace.strip()]
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if full_range:
                         args += ['--full-range',
                                  '--midi-lo', str(int(midi_lo)),
@@ -488,7 +488,7 @@ def build_ui():
                         args += ['--wet', f'{wet:.2f}']
                         if notes.strip(): args += ['--notes'] + notes.split()
                         if vel.strip():   args += ['--vel']   + vel.split()
-                    if output.strip():   args += ['--output', output.strip()]
+                    if (output or '').strip(): args += ['--output', output.strip()]
                     if no_skip_val:      args.append('--no-skip')
                     return run_command(args, gen_log)
 
