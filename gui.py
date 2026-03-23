@@ -136,13 +136,38 @@ def build_ui():
                 gr.Markdown('Extrahuje F0, hlasitost a velocity z WAV souboru do NPZ cache.\n'
                             '**Known-F0 mod** (vychozi): F0 z nazvu souboru mXXX — rychle (<0.1s/soubor).\n'
                             '**pyin mod**: pomalý odhad F0 (~20s/soubor) — pro nastroje bez MIDI v nazvu.')
+                ext_status_out = gr.Textbox(label='Hotove extrakce (NPZ cache)',
+                                            lines=6, interactive=False, max_lines=6)
+                ext_status_timer = gr.Timer(value=3)
                 chunk_sec  = gr.Slider(0, 120, value=0, step=10,
-                                       label='chunk-sec (0 = bez rozdeleni, doporuceno pro sample banky)')
-                force_pyin = gr.Checkbox(label='--force-pyin (pouzit pomalý pyin misto known-F0)')
-                ext_run    = gr.Button('Spustit extrakci', variant='primary')
-                ext_stop   = gr.Button('Stop')
-                ext_log    = gr.Textbox(label='Vystup', lines=15, interactive=False)
+                                       label='chunk-sec (0 = bez rozdeleni, doporuceno pro sample banky)',
+                                       info='Rozdelit dlouhe WAV na useky. 0 = cely soubor najednou.')
+                force_pyin = gr.Checkbox(label='--force-pyin (pouzit pomalý pyin misto known-F0)',
+                                         info='Jen pokud nazev souboru neobsahuje MIDI cislo (mXXX).')
+                with gr.Row():
+                    ext_run  = gr.Button('Spustit extrakci', variant='primary')
+                    ext_stop = gr.Button('Stop')
+                ext_log    = gr.Textbox(label='Vystup', lines=12, interactive=False)
                 ext_timer  = gr.Timer(value=2)
+
+                def read_ext_status(instrument, workspace):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    work_dir  = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    ext_dir   = os.path.join(work_dir, 'extracts')
+                    src_wavs  = len(glob.glob(os.path.join(instrument, '**', '*.wav'),
+                                              recursive=True))
+                    npz_files = sorted(glob.glob(os.path.join(ext_dir, '*.npz')))
+                    n_npz     = len(npz_files)
+                    if n_npz == 0:
+                        return f'Zadne NPZ soubory v {ext_dir}\nSpustte extrakci.'
+                    total_mb  = sum(os.path.getsize(p) for p in npz_files) / 1e6
+                    lines     = [f'{n_npz} NPZ  /  {src_wavs} WAV zdroju  '
+                                 f'({total_mb:.0f} MB)  ->  {ext_dir}', '']
+                    lines    += [os.path.basename(p) for p in npz_files[-20:]]
+                    if n_npz > 20:
+                        lines.insert(1, f'(zobrazeno poslednich 20 z {n_npz})')
+                    return '\n'.join(lines)
 
                 def run_extract(instrument, workspace, chunk_s, fp):
                     if not instrument:
@@ -152,6 +177,15 @@ def build_ui():
                     if fp: args.append('--force-pyin')
                     return run_command(args, ext_log)
 
+                ext_status_timer.tick(fn=read_ext_status,
+                                      inputs=[instrument_in, workspace_in],
+                                      outputs=ext_status_out)
+                instrument_in.change(fn=read_ext_status,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=ext_status_out)
+                workspace_in.change(fn=read_ext_status,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=ext_status_out)
                 ext_run.click(fn=run_extract,   inputs=[instrument_in, workspace_in, chunk_sec, force_pyin], outputs=ext_log)
                 ext_stop.click(fn=stop_command, outputs=ext_log)
                 ext_timer.tick(fn=poll_log,     outputs=ext_log)
@@ -164,6 +198,41 @@ def build_ui():
                     'Extrakce probehne automaticky pokud chybi. '
                     'Po skonceni se spusti **EnvelopeNet** automaticky (viz zalozka EnvelopeNet).'
                 )
+                ddsp_status_out   = gr.Textbox(label='Stav modelu', lines=2,
+                                               interactive=False, max_lines=2)
+                ddsp_status_timer = gr.Timer(value=5)
+
+                def read_ddsp_status(instrument, workspace):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    work_dir = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    best_pt  = os.path.join(work_dir, 'checkpoints', 'best.pt')
+                    cfg_path = os.path.join(work_dir, 'instrument.json')
+                    if not os.path.exists(best_pt):
+                        return 'Nenatrenovano — checkpoint neexistuje.'
+                    trn = {}
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, encoding='utf-8') as f:
+                            trn = json.load(f).get('training', {})
+                    size   = trn.get('model_size') or json.load(open(cfg_path, encoding='utf-8')).get('model_size', '?') if os.path.exists(cfg_path) else '?'
+                    ep     = trn.get('epochs_completed', '?')
+                    bv     = trn.get('best_val', '?')
+                    ts     = trn.get('last_trained', '')
+                    mb     = os.path.getsize(best_pt) / 1e6
+                    return (f'HOTOVO  model={size}  ep={ep}  best_val={bv}  '
+                            f'[{ts}]\n'
+                            f'checkpoint: {best_pt}  ({mb:.1f} MB)')
+
+                ddsp_status_timer.tick(fn=read_ddsp_status,
+                                       inputs=[instrument_in, workspace_in],
+                                       outputs=ddsp_status_out)
+                instrument_in.change(fn=read_ddsp_status,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=ddsp_status_out)
+                workspace_in.change(fn=read_ddsp_status,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=ddsp_status_out)
+
                 with gr.Row():
                     model_size = gr.Dropdown(
                         ['small', 'medium', 'large'], value='small',
@@ -236,6 +305,41 @@ def build_ui():
                     '(~2 ms v prvnich 500 ms), a vazeny MSE loss pro zdurazneni attacku.\n'
                     'Tréning je rychly (~minuty) a spusti se automaticky na konci `DDSP Model`.'
                 )
+                env_status_out   = gr.Textbox(label='Stav EnvelopeNet', lines=2,
+                                              interactive=False, max_lines=2)
+                env_status_timer = gr.Timer(value=5)
+
+                def read_env_status(instrument, workspace):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    work_dir = workspace.strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    env_pt   = os.path.join(work_dir, 'checkpoints', 'envelope.pt')
+                    if not os.path.exists(env_pt):
+                        return 'Nenatrenovano — envelope.pt neexistuje.'
+                    mb = os.path.getsize(env_pt) / 1e6
+                    ts = time.strftime('%Y-%m-%d %H:%M',
+                                       time.localtime(os.path.getmtime(env_pt)))
+                    try:
+                        import torch as _torch
+                        ckpt   = _torch.load(env_pt, map_location='cpu', weights_only=True)
+                        n_env  = ckpt.get('n_env', '?')
+                        warp   = ckpt.get('warp', '?')
+                        detail = f'n_env={n_env}  warp={warp}'
+                    except Exception:
+                        detail = '(nelze nacist detail)'
+                    return (f'HOTOVO  {detail}  [{ts}]\n'
+                            f'checkpoint: {env_pt}  ({mb:.2f} MB)')
+
+                env_status_timer.tick(fn=read_env_status,
+                                      inputs=[instrument_in, workspace_in],
+                                      outputs=env_status_out)
+                instrument_in.change(fn=read_env_status,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=env_status_out)
+                workspace_in.change(fn=read_env_status,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=env_status_out)
+
                 with gr.Row():
                     env_epochs_sl = gr.Slider(100, 5000, value=1000, step=100,
                                               label='Pocet epoch',
@@ -288,6 +392,36 @@ def build_ui():
                     'Generuje WAV vzorky pomoci natrenovaneho modelu.\n'
                     'Vystup: `C:\\SoundBanks\\IthacaPlayer\\<nastroj>\\`'
                 )
+                gen_status_out   = gr.Textbox(label='Stav generovani', lines=2,
+                                              interactive=False, max_lines=2)
+                gen_status_timer = gr.Timer(value=5)
+
+                def read_gen_status(instrument, workspace, output):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    name      = os.path.basename(instrument.rstrip('/\\'))
+                    out_dir   = output.strip() or os.path.join(ITHACA_ROOT, name)
+                    wav_files = glob.glob(os.path.join(out_dir, '*.wav'))
+                    n_wav     = len(wav_files)
+                    if n_wav == 0:
+                        return f'Zadne WAV soubory v {out_dir}'
+                    total_mb  = sum(os.path.getsize(p) for p in wav_files) / 1e6
+                    ts = time.strftime('%Y-%m-%d %H:%M',
+                                       time.localtime(max(os.path.getmtime(p) for p in wav_files)))
+                    return (f'HOTOVO  {n_wav} WAV souboru  ({total_mb:.0f} MB)  '
+                            f'posledni zmena [{ts}]\n'
+                            f'vystup: {out_dir}')
+
+                gen_status_timer.tick(fn=read_gen_status,
+                                      inputs=[instrument_in, workspace_in, output_in],
+                                      outputs=gen_status_out)
+                instrument_in.change(fn=read_gen_status,
+                                     inputs=[instrument_in, workspace_in, output_in],
+                                     outputs=gen_status_out)
+                workspace_in.change(fn=read_gen_status,
+                                    inputs=[instrument_in, workspace_in, output_in],
+                                    outputs=gen_status_out)
+
                 with gr.Row():
                     full_range_chk = gr.Checkbox(
                         label='Full-range mod (kompletni chromaticka banka)',
@@ -376,6 +510,9 @@ def build_ui():
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
                 gen_timer.tick(fn=poll_log, outputs=gen_log)
+                output_in.change(fn=read_gen_status,
+                                 inputs=[instrument_in, workspace_in, output_in],
+                                 outputs=gen_status_out)
 
     return app
 
