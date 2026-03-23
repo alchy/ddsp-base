@@ -209,6 +209,12 @@ def convert(sfz_path: str, out_dir: str,
     skipped  = 0
 
     for r in regions:
+        # Přeskoč release, legato, first triggery — chceme jen normální attack sample
+        trigger = r.get('trigger', 'attack').lower()
+        if trigger not in ('attack', ''):
+            skipped += 1
+            continue
+
         sample = r.get('sample') or r.get('sample_path', '')
         if not sample:
             skipped += 1
@@ -225,7 +231,7 @@ def convert(sfz_path: str, out_dir: str,
                 midi = _note_name_to_midi(raw)
                 if midi is not None:
                     break
-        if midi is None:
+        if midi is None or midi < 0 or midi > 127:
             skipped += 1
             continue
 
