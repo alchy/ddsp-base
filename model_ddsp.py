@@ -22,7 +22,7 @@ NOISE_FFT = 256
 N_NOISE   = NOISE_FFT // 2 + 1   # = 129 spectral bins
 
 F0_MIN  = 20.0
-F0_MAX  = 5000.0
+F0_MAX  = 8000.0
 F0_BINS = 64
 LO_DIM  = 16
 VEL_DIM = 8
