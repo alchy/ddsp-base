@@ -87,15 +87,16 @@ python ddsp.py generate \
   --midi-lo 33 \
   --midi-hi 94 \
   --vel-layers 8 \
-  --duration 4.0 \
   --wet 1.0
 ```
 
 - `--full-range` — generuje každý MIDI chromatic v rozsahu `--midi-lo` až `--midi-hi`
 - `--midi-lo 33` / `--midi-hi 94` — rozsah odpovídá zdrojovým vzorkům (A1–Bb6)
 - `--vel-layers 8` — 8 velocity vrstev (0–7), odpovídá zdrojové bance
-- `--duration 4.0` — délka každé noty v sekundách (pro IthacaPlayer postačí 4 s)
 - `--wet 1.0` — čistý DDSP výstup (0.0 = originál, 1.0 = plný synth)
+- **Délka každého samplu** — odvozena automaticky z NPZ extraktů (reálná naučená obálka);
+  pro každou (midi, vel) kombinaci se najde nejbližší uložená obálka z trénovacích dat.
+  Basy mohou mít přirozeně 20+ sekund dozvuku, výšky kratší.
 - Výstup: `C:\SoundBanks\IthacaPlayer\vintage-vibe\mXXX-velY-f48.wav`
 - Celkem: 62 not × 8 vel = **496 WAV souborů**
 
@@ -170,13 +171,13 @@ python ddsp.py generate \
   --midi-lo 21 \
   --midi-hi 108 \
   --vel-layers 8 \
-  --duration 6.0 \
   --wet 1.0
 ```
 
 - `--midi-lo 21` / `--midi-hi 108` — plný rozsah klavíru A0–C8
-- `--duration 6.0` — piano má delší dozvuk, 6 s lépe zachytí release
 - Model automaticky interpoluje mezilehlé noty (zdrojové vzorky jsou ob 3 půltóny)
+- **Délka každého samplu** — odvozena z NPZ extraktů; basové noty mohou mít reálně
+  20+ sekund dozvuku (A0 vel 7 ≈ 25 s v Salamander). Obálka se nikde neumělě neořezává.
 - Výstup: `C:\SoundBanks\IthacaPlayer\salamander\mXXX-velY-f48.wav`
 - Celkem: 88 not × 8 vel = **704 WAV souborů**
 
@@ -222,7 +223,7 @@ generate --instrument <dir>
          --midi-lo 21               # spodní nota (default A0)
          --midi-hi 108              # horní nota (default C8)
          --vel-layers 8             # počet velocity vrstev (default 8)
-         --duration 4.0             # délka noty v sekundách (default 4.0)
+                                    # délka: automaticky z NPZ obálek (žádný --duration)
          --wet 1.0                  # mix DDSP/originál (default 1.0 = čistý synth)
          --notes C4 A3 ...          # filtr: jen tyto noty (bez --full-range)
          --vel 5 7                  # filtr: jen tyto velocity vrstvy
@@ -237,7 +238,7 @@ generate --instrument <dir>
 |----------|----------------------|-----------------------|
 | `--model` | medium | medium / large |
 | `--epochs` | 200 | 300–500 |
-| `--duration` (generate) | 4.0 s | 6.0 s |
+| délka samplu (generate) | z NPZ obálek (~1–8 s) | z NPZ obálek (~3–25 s) |
 | `--midi-lo` | 33 (A1) | 21 (A0) |
 | `--midi-hi` | 94 (Bb6) | 108 (C8) |
 | `--vel-layers` | 8 | 8 |

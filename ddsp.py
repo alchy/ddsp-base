@@ -386,39 +386,46 @@ def extract_loudness_from_audio(audio: np.ndarray, n_frames: int) -> np.ndarray:
             lo[i] = 20.0 * np.log10(float(np.sqrt(np.mean(mono[s:e] ** 2) + 1e-10)) + 1e-10)
     return lo
 
-def adsr_loudness(n_frames: int, peak_db=-6.0, atk_ms=10.0, dec_ms=200.0,
-                  sus_db=-12.0, rel_ms=300.0) -> np.ndarray:
-    fps   = SR / FRAME_HOP
-    atk_f = int(atk_ms  / 1000 * fps)
-    dec_f = int(dec_ms  / 1000 * fps)
-    rel_f = int(rel_ms  / 1000 * fps)
-    sus_f = max(0, n_frames - atk_f - dec_f - rel_f)
-    lo    = np.full(n_frames, -80.0, dtype=np.float32)
-    e0, e1 = atk_f, atk_f + dec_f
-    e2, e3 = e1 + sus_f, e1 + sus_f + rel_f
-    if atk_f: lo[:e0]    = np.linspace(-60.0, peak_db, atk_f)
-    if dec_f: lo[e0:e1]  = np.linspace(peak_db, sus_db, dec_f)
-    if sus_f: lo[e1:e2]  = sus_db
-    if rel_f: lo[e2:e3]  = np.linspace(sus_db, -80.0, rel_f)
-    return lo
+def load_envelope_templates(extracts_dir: str) -> dict:
+    """Load loudness envelopes from NPZ cache.
 
-def piano_adsr(midi: int, vel_layer: int, n_vel: int, duration_s: float) -> np.ndarray:
+    Returns dict: (midi, vel) -> np.ndarray of loudness_dB per frame.
+    Uses the average of L and R channels.  For chunk files keeps the
+    longest chunk (captures full decay better than shortest).
     """
-    Synthetic piano-style ADSR loudness envelope conditioned on MIDI note and velocity.
+    import glob as _glob
+    templates: dict = {}
+    for path in sorted(_glob.glob(os.path.join(extracts_dir, '*.npz'))):
+        parsed = parse_filename(path)
+        if parsed is None:
+            continue
+        midi, vel = parsed
+        d  = np.load(path)
+        lo = ((d['loudness_L'] + d['loudness_R']) * 0.5).astype(np.float32)
+        key = (midi, vel)
+        if key not in templates or len(lo) > len(templates[key]):
+            templates[key] = lo
+    return templates
 
-    Higher velocity  -> louder peak
-    Lower MIDI note  -> longer decay and release (strings vibrate longer)
+
+def find_envelope(templates: dict, midi: int, vel: int) -> np.ndarray:
+    """Return the envelope template closest to (midi, vel).
+
+    Search order:
+      1. Exact (midi, vel) match
+      2. Nearest midi at the same vel layer
+      3. Any entry — nearest by midi + vel distance
     """
-    n_frames  = math.ceil(duration_s * SR / FRAME_HOP)
-    # Velocity -> peak dB: vel 0 = -32 dB, vel N-1 = -6 dB
-    peak_db   = -32.0 + vel_layer * 26.0 / max(n_vel - 1, 1)
-    sus_db    = peak_db - 9.0
-    # Decay/release: longer for low notes (MIDI 21 -> long, MIDI 108 -> short)
-    t         = np.clip((midi - 21) / (108 - 21), 0.0, 1.0)
-    dec_ms    = 1200.0 - t * 900.0    # 1200 ms (bass) -> 300 ms (treble)
-    rel_ms    = 800.0  - t * 600.0    # 800 ms (bass)  -> 200 ms (treble)
-    return adsr_loudness(n_frames, peak_db=peak_db, atk_ms=8.0,
-                         dec_ms=dec_ms, sus_db=sus_db, rel_ms=rel_ms)
+    if (midi, vel) in templates:
+        return templates[(midi, vel)]
+    # Same vel, nearest midi
+    same_vel = [(abs(m - midi), m) for m, v in templates if v == vel]
+    if same_vel:
+        _, best_midi = min(same_vel)
+        return templates[(best_midi, vel)]
+    # Fallback: any entry
+    best = min(templates, key=lambda k: abs(k[0] - midi) + abs(k[1] - vel) * 3)
+    return templates[best]
 
 
 @torch.no_grad()
@@ -619,14 +626,19 @@ def cmd_generate(args):
         midi_lo   = args.midi_lo
         midi_hi   = args.midi_hi
         n_vel     = args.vel_layers
-        dur_s     = args.duration
         sr_kHz    = SR // 1000
         midi_list = list(range(midi_lo, midi_hi + 1))
         total     = len(midi_list) * n_vel
 
         print(f'[ddsp generate]  FULL RANGE  {midi_to_name(midi_lo)}-{midi_to_name(midi_hi)}'
               f'  ({len(midi_list)} notes x {n_vel} vel = {total} samples)')
-        print(f'                 duration={dur_s}s  output->{output_dir}\n')
+        print(f'                 envelopes from NPZ cache  output->{output_dir}\n')
+
+        templates = load_envelope_templates(ws.extracts_dir)
+        if not templates:
+            print('[ddsp generate] ERROR: no NPZ extracts found — run extract first')
+            sys.exit(1)
+        print(f'  loaded {len(templates)} envelope template(s) from {ws.extracts_dir}\n')
 
         done = 0
         for midi in midi_list:
@@ -637,11 +649,12 @@ def cmd_generate(args):
                 if skip and os.path.exists(out_path):
                     done += 1; continue
                 try:
-                    loudness = piano_adsr(midi, vel, n_vel, dur_s)
+                    loudness = find_envelope(templates, midi, vel)
                     audio    = synthesize(model, midi, float(vel), loudness, device)
+                    dur_s    = len(loudness) * FRAME_HOP / SR
                     save_wav(out_path, audio, SR)
                     done += 1
-                    print(f'  {midi_to_name(midi):4s} m{midi:03d} vel{vel}  {freq:.1f}Hz  -> {out_name}')
+                    print(f'  {midi_to_name(midi):4s} m{midi:03d} vel{vel}  {freq:.1f}Hz  {dur_s:.1f}s  -> {out_name}')
                 except Exception as exc:
                     print(f'  ERROR m{midi:03d} vel{vel}: {exc}')
 
@@ -806,8 +819,6 @@ def main():
                        help='Highest MIDI note for --full-range (default: 108 = C8)')
     p_gen.add_argument('--vel-layers', type=int, default=8, dest='vel_layers', metavar='N',
                        help='Number of velocity layers for --full-range (default: 8)')
-    p_gen.add_argument('--duration', type=float, default=4.0, metavar='SEC',
-                       help='Note duration in seconds for --full-range (default: 4.0)')
 
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
