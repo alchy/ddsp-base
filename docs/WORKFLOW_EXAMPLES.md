@@ -68,8 +68,14 @@ python ddsp.py learn \
 
 - `--model medium` — doporučeno pro Rhodes (~452K params, dobrý kompromis kvalita/rychlost)
 - `--epochs 200` — 200 epoch pro plný timbre; pro rychlý test postačí 50
-- Checkpointy: `vintage-vibe-ddsp\checkpoints\best.pt`, `last.pt`
+- Checkpointy: `vintage-vibe-ddsp\checkpoints\best.pt`, `last.pt`, `envelope.pt`
 - Pokračování po přerušení: přidejte `--resume`
+- **EnvelopeNet** se trénuje automaticky na konci — trvá sekundy, uloží se jako `envelope.pt`
+
+Pro samostatný (re)trénink obálkového modelu:
+```bash
+python ddsp.py learn-envelope --instrument C:\SoundBanks\ddsp\vintage-vibe
+```
 
 Orientační doby trénování (model medium):
 
@@ -151,7 +157,9 @@ python ddsp.py learn \
 
 - `--model medium` — doporučeno; pro vyšší kvalitu `--model large`
 - `--epochs 300` — piano má složitější timbre, více epoch pomáhá
-- Model se uloží do `salamander-ddsp\checkpoints\best.pt`
+- Checkpointy: `salamander-ddsp\checkpoints\best.pt`, `last.pt`, `envelope.pt`
+- **EnvelopeNet** (~25K params) se trénuje automaticky na konci `learn`; naučí se
+  interpolovat délku doznívání mezi vzorkovanými notami (ob 3 půltóny → každý půltón)
 
 Pro maximální kvalitu (pomalé):
 ```bash

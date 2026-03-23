@@ -44,6 +44,7 @@ from torch.utils.data import Dataset, DataLoader
 from model_ddsp import (
     build_ddsp, count_params, FRAME_HOP, SR, F0_MAX,
     DDSPVocoder, MODEL_SIZES,
+    EnvelopeNet, N_ENV,
 )
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
 
@@ -563,6 +564,13 @@ def cmd_learn(args):
     log_f.close()
     print(f'\n[ddsp learn]  done.  best_val={best_val:.4f}  checkpoint->{best_pt}')
 
+    # --- train envelope model (fast, ~seconds) ---
+    print('\n[ddsp learn]  training EnvelopeNet ...')
+    try:
+        train_envelope_model(ws.extracts_dir, ws.checkpoints_dir, device=device)
+    except Exception as exc:
+        print(f'[ddsp learn]  WARNING: EnvelopeNet training failed: {exc}')
+
     cfg.update({'instrument': ws.name, 'source_dir': ws.source_dir,
                 'model_size': model_size, 'sr': SR,
                 'training': {
@@ -571,6 +579,81 @@ def cmd_learn(args):
                     'last_trained': _now(),
                 }})
     save_config(ws, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Command: learn-envelope
+# ---------------------------------------------------------------------------
+
+def train_envelope_model(extracts_dir: str, checkpoint_dir: str,
+                         epochs: int = 500, lr: float = 1e-3,
+                         device: 'torch.device' = None) -> 'EnvelopeNet':
+    """Train EnvelopeNet on NPZ loudness curves.  Returns trained model."""
+    import glob as _glob
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # --- gather training samples ---
+    samples = []
+    for path in sorted(_glob.glob(os.path.join(extracts_dir, '*.npz'))):
+        parsed = parse_filename(path)
+        if parsed is None:
+            continue
+        midi, vel = parsed
+        d     = np.load(path)
+        lo    = ((d['loudness_L'] + d['loudness_R']) * 0.5).astype(np.float32)
+        dur_s = len(lo) * FRAME_HOP / SR
+        # Resample to N_ENV fixed points
+        xs    = np.linspace(0.0, 1.0, len(lo))
+        xt    = np.linspace(0.0, 1.0, N_ENV)
+        shape = np.interp(xt, xs, lo).astype(np.float32)
+        samples.append((midi / 127.0, vel / 7.0, dur_s, shape))
+
+    if not samples:
+        raise RuntimeError(f'No NPZ files with parseable filenames in {extracts_dir}')
+    print(f'  EnvelopeNet: {len(samples)} samples  device={device}')
+
+    # --- tensors ---
+    midi_t  = torch.tensor([s[0] for s in samples], dtype=torch.float32, device=device)
+    vel_t   = torch.tensor([s[1] for s in samples], dtype=torch.float32, device=device)
+    dur_t   = torch.tensor([s[2] for s in samples], dtype=torch.float32, device=device)
+    shape_t = torch.tensor(np.stack([s[3] for s in samples]), dtype=torch.float32, device=device)
+
+    model_env = EnvelopeNet().to(device)
+    opt       = torch.optim.Adam(model_env.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.01)
+
+    for epoch in range(1, epochs + 1):
+        pred_dur, pred_shape = model_env(midi_t, vel_t)
+        loss_shape = F.mse_loss(pred_shape, shape_t)
+        loss_dur   = F.mse_loss(torch.log(pred_dur), torch.log(dur_t.clamp(min=0.5)))
+        loss       = loss_shape + loss_dur
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        scheduler.step()
+        if epoch % 100 == 0 or epoch == epochs:
+            print(f'    ep {epoch:4d}  loss={loss.item():.5f}'
+                  f'  (shape={loss_shape.item():.5f}  dur={loss_dur.item():.5f})')
+
+    env_pt = os.path.join(checkpoint_dir, 'envelope.pt')
+    torch.save(model_env.state_dict(), env_pt)
+    print(f'  EnvelopeNet saved -> {env_pt}')
+    return model_env
+
+
+def cmd_learn_envelope(args):
+    ws = make_workspace(args.instrument, getattr(args, 'workspace', None))
+    if not os.path.isdir(ws.extracts_dir):
+        print(f'[learn-envelope] ERROR: no extracts dir at {ws.extracts_dir}')
+        print('[learn-envelope] Run: python ddsp.py extract --instrument <path>')
+        sys.exit(1)
+    os.makedirs(ws.checkpoints_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'[learn-envelope]  instrument={ws.name}  device={device}')
+    train_envelope_model(ws.extracts_dir, ws.checkpoints_dir,
+                         epochs=args.epochs, lr=args.lr, device=device)
+    print(f'[learn-envelope]  done.')
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +677,15 @@ def cmd_generate(args):
     model.eval()
     print(f'[ddsp generate]  instrument={ws.name}  model={model_size}  device={device}')
     print(f'                 checkpoint -> {best_pt}')
+
+    # Load envelope model if available
+    env_pt     = os.path.join(ws.checkpoints_dir, 'envelope.pt')
+    env_model  = None
+    if os.path.exists(env_pt):
+        env_model = EnvelopeNet().to(device)
+        env_model.load_state_dict(torch.load(env_pt, map_location=device, weights_only=True))
+        env_model.eval()
+        print(f'                 envelope   -> {env_pt}')
 
     wav_files = scan_instrument_dir(ws.source_dir)
     if not wav_files:
@@ -630,15 +722,20 @@ def cmd_generate(args):
         midi_list = list(range(midi_lo, midi_hi + 1))
         total     = len(midi_list) * n_vel
 
+        if env_model is not None:
+            env_source = 'EnvelopeNet (learned)'
+            templates  = None
+        else:
+            env_source = 'NPZ cache (nearest-neighbour)'
+            templates  = load_envelope_templates(ws.extracts_dir)
+            if not templates:
+                print('[ddsp generate] ERROR: no NPZ extracts and no envelope.pt'
+                      ' — run extract + learn first')
+                sys.exit(1)
+
         print(f'[ddsp generate]  FULL RANGE  {midi_to_name(midi_lo)}-{midi_to_name(midi_hi)}'
               f'  ({len(midi_list)} notes x {n_vel} vel = {total} samples)')
-        print(f'                 envelopes from NPZ cache  output->{output_dir}\n')
-
-        templates = load_envelope_templates(ws.extracts_dir)
-        if not templates:
-            print('[ddsp generate] ERROR: no NPZ extracts found — run extract first')
-            sys.exit(1)
-        print(f'  loaded {len(templates)} envelope template(s) from {ws.extracts_dir}\n')
+        print(f'                 envelopes: {env_source}  output->{output_dir}\n')
 
         done = 0
         for midi in midi_list:
@@ -649,7 +746,10 @@ def cmd_generate(args):
                 if skip and os.path.exists(out_path):
                     done += 1; continue
                 try:
-                    loudness = find_envelope(templates, midi, vel)
+                    if env_model is not None:
+                        loudness = env_model.predict_envelope(midi, vel)
+                    else:
+                        loudness = find_envelope(templates, midi, vel)
                     audio    = synthesize(model, midi, float(vel), loudness, device)
                     dur_s    = len(loudness) * FRAME_HOP / SR
                     save_wav(out_path, audio, SR)
@@ -820,6 +920,16 @@ def main():
     p_gen.add_argument('--vel-layers', type=int, default=8, dest='vel_layers', metavar='N',
                        help='Number of velocity layers for --full-range (default: 8)')
 
+    # --- learn-envelope ---
+    p_env = subs.add_parser('learn-envelope',
+                             help='Train EnvelopeNet on NPZ loudness curves (fast, ~seconds)')
+    p_env.add_argument('--instrument', required=True, metavar='DIR')
+    p_env.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
+    p_env.add_argument('--epochs', type=int, default=500,
+                       help='Training epochs (default: 500)')
+    p_env.add_argument('--lr', type=float, default=1e-3,
+                       help='Learning rate (default: 1e-3)')
+
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
     p_sts.add_argument('--instrument', required=True, metavar='DIR')
@@ -828,10 +938,11 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
-        'extract':  cmd_extract,
-        'learn':    cmd_learn,
-        'generate': cmd_generate,
-        'status':   cmd_status,
+        'extract':        cmd_extract,
+        'learn':          cmd_learn,
+        'learn-envelope': cmd_learn_envelope,
+        'generate':       cmd_generate,
+        'status':         cmd_status,
     }
     dispatch[args.command](args)
 

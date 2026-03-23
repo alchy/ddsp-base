@@ -248,6 +248,64 @@ def count_params(model: DDSPVocoder) -> int:
 
 
 # ---------------------------------------------------------------------------
+# EnvelopeNet — tiny MLP for loudness envelope prediction
+# ---------------------------------------------------------------------------
+
+N_ENV = 256   # fixed time-axis resolution for envelope shape
+
+
+class EnvelopeNet(nn.Module):
+    """
+    Tiny MLP: (midi_norm, vel_norm) -> (dur_s, shape[N_ENV])
+
+    Learns instrument-specific loudness envelopes from NPZ training data.
+    At inference, the predicted shape is resampled to match the predicted
+    duration, giving the correct-length loudness array for the synthesizer.
+
+    Normalization: midi_norm = midi / 127, vel_norm = vel / 7
+    Parameters: ~10 K (hidden=64)
+    """
+
+    def __init__(self, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1 + N_ENV),
+        )
+
+    def forward(self, midi_norm: torch.Tensor,
+                vel_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        midi_norm, vel_norm: (B,) in [0, 1]
+        Returns:
+          dur_s  — (B,)       predicted duration in seconds (≥ 0.5 s)
+          shape  — (B, N_ENV) loudness curve in dB at N_ENV time steps
+        """
+        x   = torch.stack([midi_norm, vel_norm], dim=-1)
+        out = self.net(x)
+        dur_s = F.softplus(out[:, 0]) + 0.5   # floor at 0.5 s
+        shape = out[:, 1:]                      # (B, N_ENV) unconstrained dB
+        return dur_s, shape
+
+    def predict_envelope(self, midi: int, vel: int) -> 'np.ndarray':
+        """Return loudness np.ndarray (n_frames,) for a single (midi, vel)."""
+        import numpy as np
+        device    = next(self.parameters()).device
+        midi_t    = torch.tensor([midi / 127.0], dtype=torch.float32, device=device)
+        vel_t     = torch.tensor([vel  /   7.0], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            dur_s, shape = self(midi_t, vel_t)
+        dur_s    = float(dur_s[0])
+        shape_np = shape[0].cpu().numpy()
+        n_frames = max(1, round(dur_s * SR / FRAME_HOP))
+        xs = np.linspace(0.0, 1.0, N_ENV)
+        xt = np.linspace(0.0, 1.0, n_frames)
+        return np.interp(xt, xs, shape_np).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Sanity check
 # ---------------------------------------------------------------------------
 
