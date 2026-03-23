@@ -31,21 +31,23 @@ jako čistě neuronové metody.
 
 ## Signálový model
 
-Výstupní audio je součet dvou složek:
+Výstup je plně stereo — každý kanál má nezávislé harmonické amplitudy i šumový profil:
 
 ```
-audio(t) = harmonic(t) + noise(t)
+L(t) = overall_amp(t) * SUM_k [ a_k_L(t) * sin(2*pi * k * F0(t) * t / SR) ]
+     + ISTFT( STFT(white_noise_L) * mag_spectrum_L(t) )
 
-harmonic(t) = overall_amp(t) * SUM_k [ a_k(t) * sin(2*pi * k * F0(t) * t / SR) ]
-              k = 1 .. N_HARM (32 harmonických oscilátorů)
+R(t) = overall_amp(t) * SUM_k [ a_k_R(t) * sin(2*pi * k * F0(t) * t / SR) ]
+     + ISTFT( STFT(white_noise_R) * mag_spectrum_R(t) )
 
-noise(t) = ISTFT( STFT(white_noise) * mag_spectrum(t) )
-           mag_spectrum(t): N_NOISE (129) spektrálních koeficientů
+k = 1 .. N_HARM (32 harmonických oscilátorů)
+mag_spectrum: N_NOISE (129) spektrálních koeficientů
 ```
 
-Amplitudy `a_k(t)` a spektrum šumu `mag_spectrum(t)` produkuje neuronová síť
-pro každý rámec (5 ms). Stereo výstup vznikne tak, že harmonic sdílí oba kanály,
-ale každý kanál má vlastní šumový procesor (`head_noise_L`, `head_noise_R`).
+Amplitudy `a_k_L(t)`, `a_k_R(t)` produkují dvě nezávislé hlavy (`head_harm_L`, `head_harm_R`).
+Model se tak z dat naučí, jak se liší overtone balance mezi kanály — například
+prostorové rozložení strun klavíru (bas vlevo, výšky vpravo) nebo rozdílný přenos
+frekvencí u různých mikrofonních pozic. `overall_amp` je sdílená obálka pro oba kanály.
 
 ---
 
@@ -128,15 +130,18 @@ Jednovrstvá MLP po GRU rozšíří reprezentaci před výstupními hlavami:
 
 ### Výstupní hlavy
 
-Čtyři lineární vrstvy z `mlp_dim`:
+Pět lineárních vrstev z `mlp_dim`:
 
 | Hlava | Aktivace | Výstup | Popis |
 |-------|----------|--------|-------|
-| `head_harm` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k |
-| `head_amp` | softplus | (B, T, 1) | Celková obálka overall_amp |
+| `head_harm_L` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — levý kanál |
+| `head_harm_R` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — pravý kanál |
+| `head_amp` | softplus | (B, T, 1) | Celková obálka overall_amp (sdílená) |
 | `head_noise_L` | sigmoid | (B, T, 129) | Spektrum šumu — levý kanál |
 | `head_noise_R` | sigmoid | (B, T, 129) | Spektrum šumu — pravý kanál |
 
+`head_harm_L` a `head_harm_R` jsou zcela nezávislé — model se naučí jiný overtone
+profil pro každý kanál podle toho, co data obsahují (stereo rozložení, rozdíly mikrofonů).
 Bias šumových hlav je inicializován na -3.0 (ticho na začátku trénování).
 
 ### Syntetizátory
@@ -230,15 +235,16 @@ Trenovaci batch (B, T=50)
         |  GRU     -> (B, T, gru_hidden)
         |  post_mlp -> (B, T, mlp_dim)
         |
-        |  head_harm    -> sigmoid -> (B, T, 32)  --.
-        |  head_amp     -> softplus -> (B, T, 1)  --|--> HarmonicSynth -> (B, 1, T*HOP)
-        |  head_noise_L -> sigmoid -> (B, T, 129) --|--> NoiseSynth_L  -> (B, 1, T*HOP)
-        |  head_noise_R -> sigmoid -> (B, T, 129) --'--> NoiseSynth_R  -> (B, 1, T*HOP)
+        |  head_harm_L  -> sigmoid -> (B, T, 32)  --.--> HarmonicSynth -> harmonic_L (B, 1, T*HOP)
+        |  head_harm_R  -> sigmoid -> (B, T, 32)  --'--> HarmonicSynth -> harmonic_R (B, 1, T*HOP)
+        |  head_amp     -> softplus -> (B, T, 1)  -----> (sdilena obalka pro oba kanaly)
+        |  head_noise_L -> sigmoid -> (B, T, 129) -----> NoiseSynth_L  -> (B, 1, T*HOP)
+        |  head_noise_R -> sigmoid -> (B, T, 129) -----> NoiseSynth_R  -> (B, 1, T*HOP)
         |
         v
 Stereo audio (B, 2, T*HOP)
-  L = harmonic + noise_L
-  R = harmonic + noise_R
+  L = harmonic_L + noise_L
+  R = harmonic_R + noise_R
         |
         v  [mrstft_loss + 0.2 * L1]
         |
@@ -251,9 +257,9 @@ Gradient -> Adam -> aktualizace vah
 
 | Preset | gru_hidden | gru_layers | mlp_dim | Parametry | Doporucene pouziti |
 |--------|-----------|------------|---------|-----------|-------------------|
-| `small` | 64 | 1 | 128 | ~84 K | Rychle CPU trenovani, baseline |
-| `medium` | 128 | 2 | 256 | ~400 K | Dobry kompromis, doporuceny default |
-| `large` | 256 | 3 | 512 | ~1.9 M | Nejlepsi kvalita, pomale na CPU |
+| `small` | 64 | 1 | 128 | ~115 K | Rychle CPU trenovani, baseline |
+| `medium` | 128 | 2 | 256 | ~452 K | Dobry kompromis, doporuceny default |
+| `large` | 256 | 3 | 512 | ~1.99 M | Nejlepsi kvalita, pomale na CPU |
 
 Preset se vybira pres CLI: `python ddsp.py learn --model medium --instrument <path>`.
 Trenovaci checkpointy (`best.pt`, `last.pt`) obsahuji informaci o velikosti modelu,
