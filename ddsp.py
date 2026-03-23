@@ -83,6 +83,17 @@ class Workspace:
             os.makedirs(d, exist_ok=True)
 
 
+def resolve_device(requested: str = 'auto') -> 'torch.device':
+    """Return torch.device from 'auto' | 'cpu' | 'mps' | 'cuda'."""
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+            return torch.device('mps')
+        return torch.device('cpu')
+    return torch.device(requested)
+
+
 def make_workspace(instrument: str, workspace: str = None) -> Workspace:
     source_dir = os.path.abspath(instrument)
     if workspace:
@@ -507,7 +518,7 @@ def cmd_learn(args):
         print('[ddsp learn] No extracts found -- running extraction first.')
         extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=60)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     print(f'[ddsp learn]  instrument={ws.name}  model={model_size}  device={device}')
     print(f'              source  -> {ws.source_dir}')
     print(f'              work    -> {ws.work_dir}')
@@ -761,7 +772,7 @@ def cmd_learn_envelope(args):
         print('[learn-envelope] Run: python ddsp.py extract --instrument <path>')
         sys.exit(1)
     os.makedirs(ws.checkpoints_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     print(f'[learn-envelope]  instrument={ws.name}  device={device}')
     train_envelope_model(ws.extracts_dir, ws.checkpoints_dir,
                          epochs=args.epochs, lr=args.lr,
@@ -787,7 +798,7 @@ def cmd_generate(args):
         print('[ddsp generate] Run: python ddsp.py learn --instrument <path>')
         sys.exit(1)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     model  = build_ddsp(size=model_size).to(device)
     model.load_state_dict(torch.load(best_pt, map_location=device, weights_only=True))
     model.eval()
@@ -1025,6 +1036,9 @@ def main():
     p_lrn.add_argument('--env-mix', type=float, default=0.5, dest='env_mix',
                        help='Fraction of training batches using EnvelopeNet loudness in '
                             'coupled mode (default: 0.5)')
+    p_lrn.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- generate ---
     p_gen = subs.add_parser('generate', help='Generate sample bank from trained model')
@@ -1057,6 +1071,9 @@ def main():
     p_gen.add_argument('--attack-ramp-ms', type=float, default=10.0,
                        dest='attack_ramp_ms',
                        help='Hard onset ramp length in ms (0=off, default: 10)')
+    p_gen.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- learn-envelope ---
     p_env = subs.add_parser('learn-envelope',
@@ -1076,6 +1093,9 @@ def main():
     p_env.add_argument('--attack-weight', type=float, default=5.0,
                        dest='attack_weight',
                        help='MSE weight multiplier for attack region (default: 5.0)')
+    p_env.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
