@@ -160,6 +160,66 @@ Vypise:
 
 ---
 
+## Konvertory
+
+### SFZ banka → mXXX-velX-fXX.wav
+
+Převede libovolnou SFZ instrument banku (Salamander, Piano in 162 a jiné)
+do formátu kompatibilního s DDSP pipeline a sample playerem.
+
+```bash
+python sfz_convert.py <soubor.sfz> <vystupni_adresar> [volby]
+
+# Příklady:
+python sfz_convert.py Salamander.sfz C:/samples/salamander
+python sfz_convert.py Piano162.sfz C:/samples/piano162 --vel-layers 8 --sr 48000
+python sfz_convert.py Salamander.sfz C:/samples/salamander --dry-run
+```
+
+Výstup: adresář s `mXXX-velX-f48.wav` soubory + `instrument-definition.json`.
+
+| Parametr | Výchozí | Popis |
+|----------|---------|-------|
+| `--vel-layers N` | `8` | Počet velocity vrstev ve výstupu |
+| `--sr HZ` | `48000` | Cílový sample rate v Hz |
+| `--name NAZEV` | z SFZ nebo název souboru | Název nástroje |
+| `--dry-run` | off | Zobraz mapování bez zápisu souborů |
+
+Pokud má SFZ více velocity vrstev než výstup (např. 16 → 8), vybere se
+8 rovnoměrně rozložených vrstev. Pokud méně, použije se nejbližší dostupná.
+Resample probíhá automaticky přes scipy nebo librosa pokud se SR liší.
+
+---
+
+### mXXX-velX-fXX.wav → SFZ
+
+Převede existující banku ve formátu sample playeru zpět do standardního SFZ.
+Vhodné pro export do Kontaktu, sforzanda nebo jiných SFZ playerů.
+
+```bash
+python bank_to_sfz.py <adresar_banky> [volby]
+
+# Příklady:
+python bank_to_sfz.py C:/samples/rhodes
+python bank_to_sfz.py C:/samples/rhodes --out C:/exports/rhodes.sfz --sr 48
+python bank_to_sfz.py C:/samples/rhodes --absolute-paths
+```
+
+Výstup: `.sfz` soubor vedle adresáře (nebo `--out`).
+
+| Parametr | Výchozí | Popis |
+|----------|---------|-------|
+| `--out FILE` | `<adresar>.sfz` | Výstupní cesta |
+| `--sr KHZ` | preferuje vyšší | Použij jen soubory tohoto SR (např. `48`) |
+| `--name NAZEV` | z `instrument-definition.json` | Název nástroje |
+| `--absolute-paths` | off | Absolutní cesty místo relativních |
+
+Key ranges jsou automaticky rozloženy — každá nota pokrývá oblast od středu
+k sousední notě vlevo a vpravo. Krajní noty sahají na MIDI 0 a 127.
+Velocity vrstvy 0–7 jsou mapovány na rovnoměrné pásma 0–127.
+
+---
+
 ## Graficke rozhrani
 
 ```bash
@@ -212,9 +272,9 @@ Log se aktualizuje kazdé 2 sekundy. Tlacitko Stop prerusi beh prikazu.
 
 | Preset | Parametry | gru_hidden | Vrstvy GRU | mlp_dim |
 |--------|-----------|-----------|------------|---------|
-| `small` | ~84 K | 64 | 1 | 128 |
-| `medium` | ~400 K | 128 | 2 | 256 |
-| `large` | ~1.9 M | 256 | 3 | 512 |
+| `small` | ~115 K | 64 | 1 | 128 |
+| `medium` | ~452 K | 128 | 2 | 256 |
+| `large` | ~1.99 M | 256 | 3 | 512 |
 
 ### Format nazvu souboru
 
