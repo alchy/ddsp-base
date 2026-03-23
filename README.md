@@ -129,11 +129,14 @@ python sfz_convert.py C:\SoundBanks\SFZ\<jmeno>\*.sfz C:\SoundBanks\ddsp\<jmeno>
 ### 3. Extrakce priznaku
 
 ```bash
-python ddsp.py extract --instrument <adresar> [--chunk-sec 60]
+python ddsp.py extract --instrument <adresar> [--chunk-sec 60] [--force-pyin]
 ```
 
 Prikaz pro kazdy WAV:
-- extrahuje F0 pomoci pYIN (librosa)
+- **known-F0 mod (vychozi)**: pokud nazev souboru obsahuje MIDI notu (`mXXX`), F0 se odvodi
+  primo z nazvu (<0.1 s/soubor) — extrakce celeho archivniho piana zabere sekundy misto hodin
+- **pyin mod (zaloha)**: pokud MIDI nelze parseovat, nebo je zadan `--force-pyin`, spusti se
+  pomalejsi odhad pyin (~20 s/soubor)
 - vypocita RMS loudness per kanal per ramec
 - ulozi do `<nastroj>-ddsp/extracts/*.npz`
 

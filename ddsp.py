@@ -164,7 +164,8 @@ def loudness_db(audio: np.ndarray, hop: int = FRAME_HOP) -> np.ndarray:
 
 
 def extract_features(audio: np.ndarray):
-    """Extract (f0, loudness_L, loudness_R, voiced_prob) at FRAME_HOP resolution."""
+    """Extract features using pyin F0 estimation (slow, ~20s/file).
+    Used as fallback when MIDI note is not known from filename."""
     import librosa
     mono = audio.mean(axis=0)
     f0, _, voiced_prob = librosa.pyin(
@@ -179,8 +180,33 @@ def extract_features(audio: np.ndarray):
     return dict(f0=f0[:T], loudness_L=lo_L[:T], loudness_R=lo_R[:T], voiced_prob=voiced_prob[:T])
 
 
-def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0):
-    """Extract & cache features as NPZ.  Skips already-cached files."""
+def extract_features_known_f0(audio: np.ndarray, midi: int):
+    """Extract features using known MIDI note as F0 (fast, <0.1s/file).
+    Default path for mXXX-velX-fXX.wav banks where note is in filename.
+
+    voiced_prob is derived from RMS loudness: frames above -60 dB are
+    considered voiced. This is accurate for isolated note samples.
+    """
+    lo_L = loudness_db(audio[0])
+    lo_R = loudness_db(audio[1])
+    T    = min(len(lo_L), len(lo_R))
+    freq = float(440.0 * (2.0 ** ((midi - 69) / 12.0)))
+    f0   = np.full(T, freq, dtype=np.float32)
+    # Voiced = loudness above noise floor (-60 dB), smoothed over 3 frames
+    lo_m = (lo_L[:T] + lo_R[:T]) * 0.5
+    raw  = (lo_m > -60.0).astype(np.float32)
+    voiced_prob = np.convolve(raw, np.ones(3) / 3.0, mode='same').astype(np.float32)
+    return dict(f0=f0, loudness_L=lo_L[:T], loudness_R=lo_R[:T], voiced_prob=voiced_prob)
+
+
+def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0,
+                      force_pyin: bool = False):
+    """Extract & cache features as NPZ.  Skips already-cached files.
+
+    When the filename follows the mXXX-velY-fXX.wav convention the MIDI note
+    is used directly as F0 (fast, <0.1 s/file).  Pass force_pyin=True to
+    always run the slower pyin estimator instead.
+    """
     os.makedirs(extracts_dir, exist_ok=True)
     files = scan_source_dir(source_dir)
     if not files:
@@ -201,6 +227,7 @@ def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0):
             dur_s = audio.shape[-1] / SR
 
             parsed = parse_filename(path)
+            known_midi = parsed[0] if parsed else None
             if parsed and parsed[1] is not None:
                 vel_constant, vel_dynamic = float(parsed[1]), None
             else:
@@ -209,6 +236,7 @@ def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0):
                 vel_constant = None
 
             n_chunks  = max(1, math.ceil(audio.shape[1] / (chunk_sec * SR))) if chunk_sec else 1
+            use_known = (known_midi is not None) and (not force_pyin)
             for ci in range(n_chunks):
                 if chunk_sec:
                     s, e   = ci * chunk_sec * SR, min((ci + 1) * chunk_sec * SR, audio.shape[1])
@@ -218,9 +246,13 @@ def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0):
                 else:
                     chunk, label, out_name = audio, os.path.basename(path), name + '.npz'
 
-                print(f'  {label} ... ', end='', flush=True)
+                mode_tag = 'known-f0' if use_known else 'pyin'
+                print(f'  {label} [{mode_tag}] ... ', end='', flush=True)
                 t1    = time.time()
-                feats = extract_features(chunk)
+                if use_known:
+                    feats = extract_features_known_f0(chunk, known_midi)
+                else:
+                    feats = extract_features(chunk)
                 T_fr  = len(feats['f0'])
                 if vel_constant is not None:
                     vel_frames = np.full(T_fr, vel_constant, dtype=np.float32)
@@ -411,7 +443,9 @@ def cmd_extract(args):
     ws.makedirs()
     print(f'[ddsp extract]  source  -> {ws.source_dir}')
     print(f'                cache   -> {ws.extracts_dir}')
-    n = extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=args.chunk_sec)
+    force_pyin = getattr(args, 'force_pyin', False)
+    n = extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=args.chunk_sec,
+                          force_pyin=force_pyin)
     cfg = load_config(ws)
     cfg.update({'instrument': ws.name, 'source_dir': ws.source_dir,
                 'extract': {'completed': True, 'n_new': n, 'completed_at': _now(),
@@ -732,6 +766,8 @@ def main():
     p_ext.add_argument('--chunk-sec', type=int, default=60, metavar='SEC',
                        dest='chunk_sec',
                        help='Split long files into chunks of SEC seconds (0=off, default: 60)')
+    p_ext.add_argument('--force-pyin', action='store_true', dest='force_pyin',
+                       help='Force slow pyin F0 estimation even when MIDI is known from filename')
 
     # --- learn ---
     p_lrn = subs.add_parser('learn', help='Train model (runs extract if needed)')
