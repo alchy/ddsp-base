@@ -251,7 +251,9 @@ def count_params(model: DDSPVocoder) -> int:
 # EnvelopeNet — tiny MLP for loudness envelope prediction
 # ---------------------------------------------------------------------------
 
-N_ENV = 256   # fixed time-axis resolution for envelope shape
+N_ENV          = 512    # number of envelope control points output by EnvelopeNet
+ENVELOPE_WARP  = 4.0   # power-law time warp — concentrates resolution near t=0 (attack)
+                        # t_store[i] = (i/(N-1))^WARP  → first N/2 points cover first 6% of note
 
 
 class EnvelopeNet(nn.Module):
@@ -259,20 +261,22 @@ class EnvelopeNet(nn.Module):
     Tiny MLP: (midi_norm, vel_norm) -> (dur_s, shape[N_ENV])
 
     Learns instrument-specific loudness envelopes from NPZ training data.
-    At inference, the predicted shape is resampled to match the predicted
-    duration, giving the correct-length loudness array for the synthesizer.
+    The shape vector uses a warped time axis (power-law, exponent ENVELOPE_WARP)
+    so that early control points cover the attack region at ~2 ms resolution,
+    while later points spread across the sustain/release at coarser resolution.
 
     Normalization: midi_norm = midi / 127, vel_norm = vel / 7
-    Parameters: ~10 K (hidden=64)
+    Parameters: ~30 K (hidden=64, N_ENV=512)
     """
 
-    def __init__(self, hidden: int = 64):
+    def __init__(self, hidden: int = 64, n_env: int = N_ENV):
         super().__init__()
+        self.n_env = n_env
         self.net = nn.Sequential(
             nn.Linear(2, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1 + N_ENV),
+            nn.Linear(hidden, 1 + n_env),
         )
 
     def forward(self, midi_norm: torch.Tensor,
@@ -281,16 +285,21 @@ class EnvelopeNet(nn.Module):
         midi_norm, vel_norm: (B,) in [0, 1]
         Returns:
           dur_s  — (B,)       predicted duration in seconds (≥ 0.5 s)
-          shape  — (B, N_ENV) loudness curve in dB at N_ENV time steps
+          shape  — (B, n_env) loudness curve in dB at warped time steps
         """
         x   = torch.stack([midi_norm, vel_norm], dim=-1)
         out = self.net(x)
         dur_s = F.softplus(out[:, 0]) + 0.5   # floor at 0.5 s
-        shape = out[:, 1:]                      # (B, N_ENV) unconstrained dB
+        shape = out[:, 1:]                      # (B, n_env) unconstrained dB
         return dur_s, shape
 
-    def predict_envelope(self, midi: int, vel: int) -> 'np.ndarray':
-        """Return loudness np.ndarray (n_frames,) for a single (midi, vel)."""
+    def predict_envelope(self, midi: int, vel: int,
+                         warp: float = ENVELOPE_WARP) -> 'np.ndarray':
+        """Return loudness np.ndarray (n_frames,) for a single (midi, vel).
+
+        The warped control points are interpolated back to a uniform frame grid
+        (FRAME_HOP = 5 ms) for the DDSP vocoder.
+        """
         import numpy as np
         device    = next(self.parameters()).device
         midi_t    = torch.tensor([midi / 127.0], dtype=torch.float32, device=device)
@@ -300,9 +309,11 @@ class EnvelopeNet(nn.Module):
         dur_s    = float(dur_s[0])
         shape_np = shape[0].cpu().numpy()
         n_frames = max(1, round(dur_s * SR / FRAME_HOP))
-        xs = np.linspace(0.0, 1.0, N_ENV)
-        xt = np.linspace(0.0, 1.0, n_frames)
-        return np.interp(xt, xs, shape_np).astype(np.float32)
+        # Warped positions where the N_ENV values are stored
+        t_store = np.power(np.linspace(0.0, 1.0, self.n_env), warp)
+        # Uniform frame positions to reconstruct
+        t_query = np.linspace(0.0, 1.0, n_frames)
+        return np.interp(t_query, t_store, shape_np).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

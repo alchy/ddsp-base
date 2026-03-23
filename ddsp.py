@@ -44,7 +44,7 @@ from torch.utils.data import Dataset, DataLoader
 from model_ddsp import (
     build_ddsp, count_params, FRAME_HOP, SR, F0_MAX,
     DDSPVocoder, MODEL_SIZES,
-    EnvelopeNet, N_ENV,
+    EnvelopeNet, N_ENV, ENVELOPE_WARP,
 )
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
 
@@ -442,6 +442,25 @@ def synthesize(model: DDSPVocoder, midi: int, velocity: float,
     return out[0].cpu().numpy()   # (2, T)
 
 
+def apply_attack_ramp(audio: np.ndarray, ramp_ms: float, sr: int = SR) -> np.ndarray:
+    """Apply a short amplitude ramp-up to the start of audio (2, T) or (T,).
+
+    The ramp is a raised-cosine (half-Hann) shape over the first ramp_ms ms,
+    ensuring a crisp, natural onset transient.  ramp_ms=0 is a no-op.
+    """
+    if ramp_ms <= 0:
+        return audio
+    n_ramp = min(int(ramp_ms * sr / 1000), audio.shape[-1])
+    ramp   = 0.5 * (1.0 - np.cos(np.pi * np.arange(n_ramp) / n_ramp)).astype(np.float32)
+    if audio.ndim == 2:
+        audio = audio.copy()
+        audio[:, :n_ramp] *= ramp
+    else:
+        audio = audio.copy()
+        audio[:n_ramp] *= ramp
+    return audio
+
+
 # ---------------------------------------------------------------------------
 # Command: extract
 # ---------------------------------------------------------------------------
@@ -567,7 +586,9 @@ def cmd_learn(args):
     # --- train envelope model (fast, ~seconds) ---
     print('\n[ddsp learn]  training EnvelopeNet ...')
     try:
-        train_envelope_model(ws.extracts_dir, ws.checkpoints_dir, device=device)
+        train_envelope_model(ws.extracts_dir, ws.checkpoints_dir, device=device,
+                             epochs=1000, lr=1e-3,
+                             warp=ENVELOPE_WARP, n_env=N_ENV, attack_weight=5.0)
     except Exception as exc:
         print(f'[ddsp learn]  WARNING: EnvelopeNet training failed: {exc}')
 
@@ -586,12 +607,30 @@ def cmd_learn(args):
 # ---------------------------------------------------------------------------
 
 def train_envelope_model(extracts_dir: str, checkpoint_dir: str,
-                         epochs: int = 500, lr: float = 1e-3,
+                         epochs: int = 1000, lr: float = 1e-3,
+                         warp: float = ENVELOPE_WARP,
+                         n_env: int = N_ENV,
+                         attack_weight: float = 5.0,
                          device: 'torch.device' = None) -> 'EnvelopeNet':
-    """Train EnvelopeNet on NPZ loudness curves.  Returns trained model."""
+    """Train EnvelopeNet on NPZ loudness curves.  Returns trained model.
+
+    Uses 2 ms loudness resolution from stored audio (hop_fine=96 @ 48 kHz) so
+    the attack region is sampled at fine resolution even though the DDSP vocoder
+    runs at 5 ms frames.  The target is resampled onto a warped time axis so
+    that early control points (attack) get proportionally more coverage.
+
+    attack_weight: MSE multiplier for the first N_ATK warped points (attack region).
+    """
     import glob as _glob
+
+    HOP_FINE  = 96                # 2 ms @ 48 kHz — fine resolution for attack
+    N_ATK     = max(1, n_env // 25)  # ~4 % of points weighted extra (≈ first 300 ms)
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Warped time axis: t_store[i] = (i/(n_env-1))^warp
+    t_store = np.power(np.linspace(0.0, 1.0, n_env), warp)
 
     # --- gather training samples ---
     samples = []
@@ -600,18 +639,22 @@ def train_envelope_model(extracts_dir: str, checkpoint_dir: str,
         if parsed is None:
             continue
         midi, vel = parsed
-        d     = np.load(path)
-        lo    = ((d['loudness_L'] + d['loudness_R']) * 0.5).astype(np.float32)
-        dur_s = len(lo) * FRAME_HOP / SR
-        # Resample to N_ENV fixed points
-        xs    = np.linspace(0.0, 1.0, len(lo))
-        xt    = np.linspace(0.0, 1.0, N_ENV)
-        shape = np.interp(xt, xs, lo).astype(np.float32)
+        d = np.load(path)
+
+        # Compute 2 ms loudness from stored audio for fine attack resolution
+        audio_np = d['audio']                             # (2, N_samples)
+        lo_fine  = loudness_db(audio_np, hop=HOP_FINE)   # ~2 ms / frame
+
+        dur_s = len(lo_fine) * HOP_FINE / SR
+        # Sample loudness at warped positions (finer near t=0)
+        xs    = np.linspace(0.0, 1.0, len(lo_fine))
+        shape = np.interp(t_store, xs, lo_fine).astype(np.float32)
         samples.append((midi / 127.0, vel / 7.0, dur_s, shape))
 
     if not samples:
         raise RuntimeError(f'No NPZ files with parseable filenames in {extracts_dir}')
-    print(f'  EnvelopeNet: {len(samples)} samples  device={device}')
+    print(f'  EnvelopeNet: {len(samples)} samples  n_env={n_env}  warp={warp}'
+          f'  attack_weight={attack_weight}  device={device}')
 
     # --- tensors ---
     midi_t  = torch.tensor([s[0] for s in samples], dtype=torch.float32, device=device)
@@ -619,13 +662,19 @@ def train_envelope_model(extracts_dir: str, checkpoint_dir: str,
     dur_t   = torch.tensor([s[2] for s in samples], dtype=torch.float32, device=device)
     shape_t = torch.tensor(np.stack([s[3] for s in samples]), dtype=torch.float32, device=device)
 
-    model_env = EnvelopeNet().to(device)
+    # Loss weight vector: attack_weight for first N_ATK points, 1.0 for the rest
+    loss_w         = torch.ones(n_env, dtype=torch.float32, device=device)
+    loss_w[:N_ATK] = attack_weight
+
+    model_env = EnvelopeNet(n_env=n_env).to(device)
     opt       = torch.optim.Adam(model_env.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.01)
 
     for epoch in range(1, epochs + 1):
         pred_dur, pred_shape = model_env(midi_t, vel_t)
-        loss_shape = F.mse_loss(pred_shape, shape_t)
+        # Weighted MSE: attack region contributes attack_weight× more to shape loss
+        err_shape  = (pred_shape - shape_t) ** 2          # (B, n_env)
+        loss_shape = (err_shape * loss_w).mean()
         loss_dur   = F.mse_loss(torch.log(pred_dur), torch.log(dur_t.clamp(min=0.5)))
         loss       = loss_shape + loss_dur
         opt.zero_grad()
@@ -637,8 +686,22 @@ def train_envelope_model(extracts_dir: str, checkpoint_dir: str,
                   f'  (shape={loss_shape.item():.5f}  dur={loss_dur.item():.5f})')
 
     env_pt = os.path.join(checkpoint_dir, 'envelope.pt')
-    torch.save(model_env.state_dict(), env_pt)
+    # Save model together with its hyperparameters so predict_envelope uses correct warp
+    torch.save({'state_dict': model_env.state_dict(),
+                'n_env': n_env, 'warp': warp}, env_pt)
     print(f'  EnvelopeNet saved -> {env_pt}')
+    return model_env
+
+
+def load_envelope_model(env_pt: str, device: 'torch.device') -> 'EnvelopeNet':
+    """Load EnvelopeNet from checkpoint (dict with state_dict + hyperparams)."""
+    ckpt      = torch.load(env_pt, map_location=device, weights_only=True)
+    n_env     = ckpt['n_env']
+    warp      = ckpt['warp']
+    model_env = EnvelopeNet(n_env=n_env).to(device)
+    model_env.load_state_dict(ckpt['state_dict'])
+    model_env._warp = warp
+    model_env.eval()
     return model_env
 
 
@@ -652,7 +715,11 @@ def cmd_learn_envelope(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'[learn-envelope]  instrument={ws.name}  device={device}')
     train_envelope_model(ws.extracts_dir, ws.checkpoints_dir,
-                         epochs=args.epochs, lr=args.lr, device=device)
+                         epochs=args.epochs, lr=args.lr,
+                         warp=args.envelope_warp,
+                         n_env=args.n_env,
+                         attack_weight=args.attack_weight,
+                         device=device)
     print(f'[learn-envelope]  done.')
 
 
@@ -679,13 +746,17 @@ def cmd_generate(args):
     print(f'                 checkpoint -> {best_pt}')
 
     # Load envelope model if available
-    env_pt     = os.path.join(ws.checkpoints_dir, 'envelope.pt')
-    env_model  = None
-    if os.path.exists(env_pt):
-        env_model = EnvelopeNet().to(device)
-        env_model.load_state_dict(torch.load(env_pt, map_location=device, weights_only=True))
-        env_model.eval()
-        print(f'                 envelope   -> {env_pt}')
+    env_pt    = os.path.join(ws.checkpoints_dir, 'envelope.pt')
+    env_model = None
+    env_src   = getattr(args, 'envelope_source', 'auto')   # auto | envelopenet | npz
+    if env_src != 'npz' and os.path.exists(env_pt):
+        env_model = load_envelope_model(env_pt, device)
+        print(f'                 envelope   -> {env_pt}  (n_env={env_model.n_env}  warp={env_model._warp})')
+    elif env_src == 'envelopenet' and not os.path.exists(env_pt):
+        print(f'[ddsp generate] ERROR: --envelope-source envelopenet but no envelope.pt found')
+        sys.exit(1)
+
+    attack_ramp_ms = getattr(args, 'attack_ramp_ms', 10)
 
     wav_files = scan_instrument_dir(ws.source_dir)
     if not wav_files:
@@ -723,7 +794,7 @@ def cmd_generate(args):
         total     = len(midi_list) * n_vel
 
         if env_model is not None:
-            env_source = 'EnvelopeNet (learned)'
+            env_source = f'EnvelopeNet (n_env={env_model.n_env}  warp={env_model._warp})'
             templates  = None
         else:
             env_source = 'NPZ cache (nearest-neighbour)'
@@ -732,6 +803,8 @@ def cmd_generate(args):
                 print('[ddsp generate] ERROR: no NPZ extracts and no envelope.pt'
                       ' — run extract + learn first')
                 sys.exit(1)
+
+        print(f'                 attack_ramp={attack_ramp_ms} ms')
 
         print(f'[ddsp generate]  FULL RANGE  {midi_to_name(midi_lo)}-{midi_to_name(midi_hi)}'
               f'  ({len(midi_list)} notes x {n_vel} vel = {total} samples)')
@@ -747,10 +820,11 @@ def cmd_generate(args):
                     done += 1; continue
                 try:
                     if env_model is not None:
-                        loudness = env_model.predict_envelope(midi, vel)
+                        loudness = env_model.predict_envelope(midi, vel, warp=env_model._warp)
                     else:
                         loudness = find_envelope(templates, midi, vel)
                     audio    = synthesize(model, midi, float(vel), loudness, device)
+                    audio    = apply_attack_ramp(audio, attack_ramp_ms)
                     dur_s    = len(loudness) * FRAME_HOP / SR
                     save_wav(out_path, audio, SR)
                     done += 1
@@ -806,6 +880,7 @@ def cmd_generate(args):
                 audio = np.pad(audio, ((0,0),(0, T - audio.shape[-1])))
             if wet < 1.0:
                 audio = wet * audio + (1.0 - wet) * ref
+            audio = apply_attack_ramp(audio, attack_ramp_ms)
             save_wav(out_path, audio, SR)
             done += 1
             note_name = midi_to_name(midi)
@@ -919,16 +994,33 @@ def main():
                        help='Highest MIDI note for --full-range (default: 108 = C8)')
     p_gen.add_argument('--vel-layers', type=int, default=8, dest='vel_layers', metavar='N',
                        help='Number of velocity layers for --full-range (default: 8)')
+    p_gen.add_argument('--envelope-source', choices=['auto', 'envelopenet', 'npz'],
+                       default='auto', dest='envelope_source',
+                       help='Envelope source: auto (EnvelopeNet if available), '
+                            'envelopenet (force NN), npz (force nearest-neighbour template). '
+                            'Default: auto')
+    p_gen.add_argument('--attack-ramp-ms', type=float, default=10.0,
+                       dest='attack_ramp_ms',
+                       help='Hard onset ramp length in ms (0=off, default: 10)')
 
     # --- learn-envelope ---
     p_env = subs.add_parser('learn-envelope',
-                             help='Train EnvelopeNet on NPZ loudness curves (fast, ~seconds)')
+                             help='Train EnvelopeNet on NPZ loudness curves (fast, ~minutes)')
     p_env.add_argument('--instrument', required=True, metavar='DIR')
     p_env.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
-    p_env.add_argument('--epochs', type=int, default=500,
-                       help='Training epochs (default: 500)')
+    p_env.add_argument('--epochs', type=int, default=1000,
+                       help='Training epochs (default: 1000)')
     p_env.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate (default: 1e-3)')
+    p_env.add_argument('--envelope-warp', type=float, default=ENVELOPE_WARP,
+                       dest='envelope_warp',
+                       help=f'Power-law time warp for attack resolution (default: {ENVELOPE_WARP})')
+    p_env.add_argument('--n-env', type=int, default=N_ENV,
+                       dest='n_env',
+                       help=f'Number of envelope control points (default: {N_ENV})')
+    p_env.add_argument('--attack-weight', type=float, default=5.0,
+                       dest='attack_weight',
+                       help='MSE weight multiplier for attack region (default: 5.0)')
 
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')

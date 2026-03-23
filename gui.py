@@ -156,24 +156,40 @@ def build_ui():
                 ext_stop.click(fn=stop_command, outputs=ext_log)
                 ext_timer.tick(fn=poll_log,     outputs=ext_log)
 
-            # -- Tab: Uceni --
-            with gr.Tab('Uceni'):
-                gr.Markdown('Trenuje DDSP model na extrahovanych datech. '
-                            'Extrakce probehne automaticky, pokud chybi. '
-                            'Po dokonceni se automaticky trénuje i **EnvelopeNet** (~sekund).')
+            # -- Tab: DDSP Model --
+            with gr.Tab('DDSP Model'):
+                gr.Markdown(
+                    '### Trenovani DDSP modelu\n'
+                    'Ucí se syntetizovat timbre nastroje z extrakci (F0, hlasitost, velocity). '
+                    'Extrakce probehne automaticky pokud chybi. '
+                    'Po skonceni se spusti **EnvelopeNet** automaticky (viz zalozka EnvelopeNet).'
+                )
                 with gr.Row():
-                    model_size = gr.Dropdown(['small', 'medium', 'large'], value='small',
-                                              label='Velikost modelu')
-                    epochs_sl  = gr.Slider(10, 500, value=100, step=10, label='Pocet epoch')
+                    model_size = gr.Dropdown(
+                        ['small', 'medium', 'large'], value='small',
+                        label='Velikost modelu',
+                        info='small ~115K param (rychle CPU), medium ~452K, large ~2M'
+                    )
+                    epochs_sl  = gr.Slider(10, 500, value=100, step=10,
+                                           label='Pocet epoch',
+                                           info='1 epocha ≈ 6-18 min CPU, dle velikosti modelu')
                     lr_sl      = gr.Slider(1e-5, 1e-3, value=3e-4, step=1e-5,
-                                           label='Learning rate', info='Doporuceno: 3e-4')
-                resume_chk  = gr.Checkbox(label='Pokracovat od posledniho checkpointu (--resume)')
+                                           label='Learning rate',
+                                           info='Doporuceno: 3e-4; sniz pokud loss osciluje')
+                resume_chk = gr.Checkbox(
+                    label='Pokracovat od posledniho checkpointu (--resume)',
+                    info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
+                )
                 with gr.Row():
-                    lrn_run     = gr.Button('Spustit uceni', variant='primary')
-                    env_run     = gr.Button('Pouze EnvelopeNet', variant='secondary')
-                    lrn_stop    = gr.Button('Stop')
-                lrn_log    = gr.Textbox(label='Vystup', lines=20, interactive=False)
-                lrn_timer  = gr.Timer(value=2)
+                    lrn_run  = gr.Button('Spustit uceni', variant='primary')
+                    lrn_stop = gr.Button('Stop')
+                lrn_log   = gr.Textbox(label='Vystup', lines=12, interactive=False)
+                lrn_timer = gr.Timer(value=2)
+
+                gr.Markdown('#### train.log (posledni epochy)')
+                trainlog_out   = gr.Textbox(label='train.log', lines=12,
+                                            interactive=False, max_lines=12)
+                trainlog_timer = gr.Timer(value=3)
 
                 def run_learn(instrument, workspace, size, epochs, lr, resume):
                     if not instrument:
@@ -185,20 +201,7 @@ def build_ui():
                     if resume: args.append('--resume')
                     return run_command(args, lrn_log)
 
-                def run_learn_envelope(instrument, workspace):
-                    if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
-                    args = ['learn-envelope', '--instrument', instrument]
-                    if workspace.strip(): args += ['--workspace', workspace.strip()]
-                    return run_command(args, lrn_log)
-
-                gr.Markdown('### train.log')
-                trainlog_out  = gr.Textbox(label='train.log (posledních 60 řádků)',
-                                           lines=12, interactive=False, max_lines=12)
-                trainlog_timer = gr.Timer(value=3)
-
                 def read_train_log(instrument, workspace):
-                    name     = os.path.basename((instrument or '').rstrip('/\\'))
                     work_dir = workspace.strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
                     log_path = os.path.join(work_dir, 'train.log')
                     if not os.path.exists(log_path):
@@ -208,13 +211,11 @@ def build_ui():
                     return ''.join(lines[-60:])
 
                 lrn_run.click(fn=run_learn,
-                               inputs=[instrument_in, workspace_in, model_size, epochs_sl, lr_sl, resume_chk],
-                               outputs=lrn_log)
-                env_run.click(fn=run_learn_envelope,
-                               inputs=[instrument_in, workspace_in],
+                               inputs=[instrument_in, workspace_in, model_size,
+                                       epochs_sl, lr_sl, resume_chk],
                                outputs=lrn_log)
                 lrn_stop.click(fn=stop_command, outputs=lrn_log)
-                lrn_timer.tick(fn=poll_log,     outputs=lrn_log)
+                lrn_timer.tick(fn=poll_log, outputs=lrn_log)
                 trainlog_timer.tick(fn=read_train_log,
                                     inputs=[instrument_in, workspace_in],
                                     outputs=trainlog_out)
@@ -225,43 +226,134 @@ def build_ui():
                                     inputs=[instrument_in, workspace_in],
                                     outputs=trainlog_out)
 
+            # -- Tab: EnvelopeNet --
+            with gr.Tab('EnvelopeNet'):
+                gr.Markdown(
+                    '### Trenovani EnvelopeNet\n'
+                    'Mala MLP (~30K param) ktera se uci tvar hlasitostni obalky z NPZ dat.\n'
+                    '**Vstup:** (midi, velocity)  **Vystup:** tvar obalky + delka tonu\n\n'
+                    'Pouziva warped casovou osu (power-law) pro jemne rozliseni attack faze '
+                    '(~2 ms v prvnich 500 ms), a vazeny MSE loss pro zdurazneni attacku.\n'
+                    'Tréning je rychly (~minuty) a spusti se automaticky na konci `DDSP Model`.'
+                )
+                with gr.Row():
+                    env_epochs_sl = gr.Slider(100, 5000, value=1000, step=100,
+                                              label='Pocet epoch',
+                                              info='1000 epoch staci pro vetsinu nastroju; '
+                                                   'zvys pro komplexnejsi obalky')
+                    env_lr_sl     = gr.Slider(1e-5, 1e-2, value=1e-3, step=1e-5,
+                                              label='Learning rate',
+                                              info='Doporuceno: 1e-3')
+                with gr.Row():
+                    env_warp_sl   = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                              label='Envelope Warp',
+                                              info='Stupen koncentrace bodu na zacatku obalky. '
+                                                   '4.0 = prvni polovina bodu pokryva prvnich 6% '
+                                                   'tonu (attack). Vys = jemnejsi attack rozliseni.')
+                    env_nenv_sl   = gr.Slider(128, 1024, value=512, step=64,
+                                              label='N ENV (pocet ridicicich bodu)',
+                                              info='Pocet bodu na warped ose. 512 = ~30K param.')
+                    env_atk_w_sl  = gr.Slider(1.0, 20.0, value=5.0, step=0.5,
+                                              label='Attack weight (MSE)',
+                                              info='Nasobitel chyby v attack oblasti (prvni ~4% '
+                                                   'bodu). 5.0 = attack prispiva 5x vice do loss.')
+                with gr.Row():
+                    env_run  = gr.Button('Spustit trenovani EnvelopeNet', variant='primary')
+                    env_stop = gr.Button('Stop')
+                env_log   = gr.Textbox(label='Vystup', lines=15, interactive=False)
+                env_timer = gr.Timer(value=2)
+
+                def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                    args = ['learn-envelope', '--instrument', instrument,
+                            '--epochs', str(int(epochs)),
+                            '--lr', f'{lr:.2e}',
+                            '--envelope-warp', f'{warp:.2f}',
+                            '--n-env', str(int(n_env)),
+                            '--attack-weight', f'{atk_w:.2f}']
+                    if workspace.strip(): args += ['--workspace', workspace.strip()]
+                    return run_command(args, env_log)
+
+                env_run.click(fn=run_learn_envelope,
+                               inputs=[instrument_in, workspace_in, env_epochs_sl,
+                                       env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl],
+                               outputs=env_log)
+                env_stop.click(fn=stop_command, outputs=env_log)
+                env_timer.tick(fn=poll_log, outputs=env_log)
+
             # -- Tab: Generovani --
             with gr.Tab('Generovani'):
-                gr.Markdown('Generuje WAV vzorky pomoci natrenovaneho modelu.\n'
-                            'Vystup: `C:\\SoundBanks\\IthacaPlayer\\<nastroj>\\`')
+                gr.Markdown(
+                    'Generuje WAV vzorky pomoci natrenovaneho modelu.\n'
+                    'Vystup: `C:\\SoundBanks\\IthacaPlayer\\<nastroj>\\`'
+                )
                 with gr.Row():
-                    full_range_chk = gr.Checkbox(label='--full-range (kompletni chromaticka banka bez zdrojovych WAV)')
-                    no_skip        = gr.Checkbox(label='--no-skip (prepsat existujici soubory)')
+                    full_range_chk = gr.Checkbox(
+                        label='Full-range mod (kompletni chromaticka banka)',
+                        info='Bez zdrojovych WAV — syntetizuje vsechny noty od MIDI lo do hi. '
+                             'Vyzaduje natrenovany EnvelopeNet nebo NPZ cache.'
+                    )
+                    no_skip = gr.Checkbox(
+                        label='--no-skip (prepsat existujici soubory)',
+                        info='Vychozi: existujici WAV preskoci. Zaskrtni pro vynuceni prepisu.'
+                    )
                 with gr.Row():
                     midi_lo_sl  = gr.Slider(0, 127, value=21, step=1,
-                                             label='MIDI lo (--midi-lo, jen full-range)',
-                                             info='21 = A0')
+                                             label='MIDI lo (jen full-range)',
+                                             info='21 = A0 (nejnizsi nota piána)')
                     midi_hi_sl  = gr.Slider(0, 127, value=108, step=1,
-                                             label='MIDI hi (--midi-hi, jen full-range)',
-                                             info='108 = C8')
+                                             label='MIDI hi (jen full-range)',
+                                             info='108 = C8 (nejvyssi nota piána)')
                     vel_layers_sl = gr.Slider(1, 8, value=8, step=1,
-                                              label='Velocity vrstvy (--vel-layers, jen full-range)')
+                                              label='Velocity vrstvy (jen full-range)',
+                                              info='Pocet velocity vrstev: 1 = pouze vel 0, '
+                                                   '8 = vel 0-7')
+                with gr.Row():
+                    env_source_radio = gr.Radio(
+                        choices=['auto', 'envelopenet', 'npz'],
+                        value='auto',
+                        label='Zdroj obalek',
+                        info='auto: EnvelopeNet pokud existuje, jinak NPZ sablony. '
+                             'envelopenet: vzdy NN (vyzaduje envelope.pt). '
+                             'npz: vzdy nejblizsi sablona z extrakci (hrubsi, bez interpolace).'
+                    )
+                    attack_ramp_sl = gr.Slider(0, 50, value=10, step=1,
+                                               label='Attack ramp (ms)',
+                                               info='Raised-cosine nabehu na zacatku tonu. '
+                                                    '0 = vypnuto. 10 ms = prirozeny uder kladivka. '
+                                                    'Platí pro oba mody (standard i full-range).')
                 with gr.Row():
                     wet_sl   = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
-                                          label='Wet (1.0 = plny DDSP, 0.0 = original, jen standardni mod)')
+                                          label='Wet (jen standardni mod)',
+                                          info='1.0 = plny DDSP vystup, 0.0 = original WAV, '
+                                               '0.5 = mix. Jen pro standardni mod.')
                     notes_in = gr.Textbox(label='Noty (prazdne = vse, jen standardni mod)',
-                                           placeholder='C4 A3 G3')
+                                           placeholder='C4 A3 G3',
+                                           info='Generovat jen tyto noty. Prazdne = vsechny.')
                     vel_in   = gr.Textbox(label='Velocity (prazdne = vse, jen standardni mod)',
-                                           placeholder='5 7')
+                                           placeholder='5 7',
+                                           info='Generovat jen tyto velocity vrstvy.')
                 output_in = gr.Textbox(
-                    label='Vystupni adresar (prazdne = C:\\SoundBanks\\IthacaPlayer\\<nastroj>\\)',
+                    label='Vystupni adresar (prazdne = IthacaPlayer/<nastroj>/)',
                     placeholder='',
+                    info=f'Vychozi: {ITHACA_ROOT}\\<nastroj>\\  '
+                         r'Muze byt relativni i absolutni cesta.'
                 )
-                gen_run   = gr.Button('Generovat', variant='primary')
-                gen_stop  = gr.Button('Stop')
+                with gr.Row():
+                    gen_run  = gr.Button('Generovat', variant='primary')
+                    gen_stop = gr.Button('Stop')
                 gen_log   = gr.Textbox(label='Vystup', lines=20, interactive=False)
                 gen_timer = gr.Timer(value=2)
 
                 def run_generate(instrument, workspace, full_range, midi_lo, midi_hi,
-                                 vel_layers, wet, notes, vel, output, no_skip_val):
+                                 vel_layers, env_src, atk_ramp, wet, notes, vel,
+                                 output, no_skip_val):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
-                    args = ['generate', '--instrument', instrument]
+                    args = ['generate', '--instrument', instrument,
+                            '--envelope-source', env_src,
+                            '--attack-ramp-ms', str(int(atk_ramp))]
                     if workspace.strip(): args += ['--workspace', workspace.strip()]
                     if full_range:
                         args += ['--full-range',
@@ -279,10 +371,11 @@ def build_ui():
                 gen_run.click(fn=run_generate,
                                inputs=[instrument_in, workspace_in, full_range_chk,
                                        midi_lo_sl, midi_hi_sl, vel_layers_sl,
+                                       env_source_radio, attack_ramp_sl,
                                        wet_sl, notes_in, vel_in, output_in, no_skip],
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
-                gen_timer.tick(fn=poll_log,     outputs=gen_log)
+                gen_timer.tick(fn=poll_log, outputs=gen_log)
 
     return app
 
