@@ -306,3 +306,66 @@ takze inference po nacteni checkpointu nepotrebuje znovu specifikovat preset.
 - **Zmena syntetizatoru**: `HarmonicSynth` a `NoiseSynth` jsou samostatne `nn.Module`, lze nahradit
 - **Vicenasobna F0 (akordy)**: rozsir `head_harm` na (B, T, N_HARM * N_VOICES) a uprav `HarmonicSynth`
 - **Vlastni loss**: nahrad `mrstft_loss` v `cmd_learn` libovolnou diferencovatelnou funkci
+
+---
+
+## Coupled vs. Decoupled trénink EnvelopeNet + DDSP
+
+Existují dva přístupy k tréninku, které se liší ve vztahu mezi EnvelopeNet a DDSP modelem.
+
+### Decoupled (výchozí, větev `main`)
+
+```
+NPZ extracts ──► DDSP trénink   (loudness z NPZ, reálná dynamika)
+NPZ extracts ──► EnvelopeNet trénink  (samostatně, kdykoli)
+
+Inference (full-range):
+  EnvelopeNet.predict(midi, vel) → loudness → DDSPVocoder → audio
+```
+
+**Výhoda**: jednodušší, rychlejší, DDSP vidí přesnou reálnou dynamiku nahrávek.
+**Nevýhoda**: mismatch distribuce — DDSP byl trénován s originální loudness,
+ale při full-range generování dostane EnvelopeNet aproximaci (hladší, warped osa).
+Tento rozdíl je v praxi malý pro standardní mód (generate ze zdrojových WAV),
+ale může ovlivnit full-range mode.
+
+### Coupled (větev `dev`, příznak `--coupled`)
+
+```
+NPZ extracts ──► EnvelopeNet trénink  (PRVNÍ)
+                     │
+                     ▼
+NPZ extracts ──► DDSP trénink  (--env-mix % batchů: loudness z EnvelopeNet,
+                                 zbytek: reálná NPZ loudness)
+
+Inference (full-range):
+  EnvelopeNet.predict(midi, vel) → loudness → DDSPVocoder → audio
+  ✓ stejná distribuce jako při tréninku
+```
+
+**Výhoda**: DDSP model vidí EnvelopeNet loudness i při tréninku → zarovnaná distribuce.
+**Výhoda**: `--env-mix 0.5` zachovává 50 % batchů s reálnou loudness → model je robustní pro standardní mód.
+**Nevýhoda**: pomalejší start (EnvelopeNet trénink ~minuty před DDSP), mírně složitější pipeline.
+
+### Volba přístupu
+
+| Situace | Doporučení |
+|---------|-----------|
+| Standardní generování (ze zdrojových WAV) | Decoupled — mismatch nevadí |
+| Full-range banka (chromatická, bez zdrojových WAV) | Coupled — lepší konzistence |
+| Rychlý experiment / prototyp | Decoupled |
+| Produkční banka pro IthacaPlayer | Coupled s `--env-mix 0.5` |
+
+### Použití
+
+```bash
+# Decoupled (default)
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300
+
+# Coupled (dev branch)
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300 \
+    --coupled --env-mix 0.5
+```
+
+V GUI (větev `dev`) je dostupný checkbox **"Coupled mode"** s posuvníkem **"EnvelopeNet mix"**
+v záložce **DDSP Model**.

@@ -250,6 +250,17 @@ def build_ui():
                     info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
                 )
                 with gr.Row():
+                    coupled_chk = gr.Checkbox(
+                        label='Coupled mode (--coupled)',
+                        info='Nejdrive natrénuje EnvelopeNet, pak DDSP trénuje s mix reálné '
+                             'a EnvelopeNet loudness. Zarovná distribuci pro full-range generování. '
+                             'Pouze v branchi dev.'
+                    )
+                    env_mix_sl = gr.Slider(0.1, 1.0, value=0.5, step=0.1,
+                                           label='EnvelopeNet mix (--env-mix)',
+                                           info='Podíl batch, kde se použije EnvelopeNet loudness '
+                                                'místo reálné NPZ. 0.5 = 50/50.')
+                with gr.Row():
                     lrn_run  = gr.Button('Spustit uceni', variant='primary')
                     lrn_stop = gr.Button('Stop')
                 lrn_log   = gr.Textbox(label='Vystup', lines=12, interactive=False)
@@ -260,14 +271,16 @@ def build_ui():
                                             interactive=False, max_lines=12)
                 trainlog_timer = gr.Timer(value=3)
 
-                def run_learn(instrument, workspace, size, epochs, lr, resume):
+                def run_learn(instrument, workspace, size, epochs, lr, resume,
+                             coupled, env_mix):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['learn', '--instrument', instrument,
                             '--model', size, '--epochs', str(int(epochs)),
                             '--lr', f'{lr:.2e}']
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
-                    if resume: args.append('--resume')
+                    if resume:  args.append('--resume')
+                    if coupled: args += ['--coupled', '--env-mix', f'{env_mix:.1f}']
                     return run_command(args, lrn_log)
 
                 def read_train_log(instrument, workspace):
@@ -281,7 +294,8 @@ def build_ui():
 
                 lrn_run.click(fn=run_learn,
                                inputs=[instrument_in, workspace_in, model_size,
-                                       epochs_sl, lr_sl, resume_chk],
+                                       epochs_sl, lr_sl, resume_chk,
+                                       coupled_chk, env_mix_sl],
                                outputs=lrn_log)
                 lrn_stop.click(fn=stop_command, outputs=lrn_log)
                 lrn_timer.tick(fn=poll_log, outputs=lrn_log)
