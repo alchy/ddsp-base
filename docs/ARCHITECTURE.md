@@ -187,27 +187,43 @@ náhodné zesílení ±2 dB, které se promítne i do loudness příznaků.
 ## Adresářová struktura
 
 ```
-<instrument>/                   <- zdrojové WAV soubory (READ-ONLY)
-<instrument>-ddsp/
-  extracts/                     <- NPZ cache extrahovaných příznaků
+C:\SoundBanks\
+  ddsp\
+    <nastroj>\                  <- zdrojové WAV soubory (READ-ONLY)
+      mXXX-velX-fXX.wav
+      instrument-definition.json
+
+  SFZ\
+    <nastroj>\                  <- původní SFZ banka (READ-ONLY)
+      *.sfz
+      *.wav
+
+  IthacaPlayer\
+    <nastroj>\                  <- vygenerované vzorky pro IthacaPlayer
+      mXXX-velX-fXX.wav
+      instrument-definition.json
+
+<nastroj>-ddsp\                 <- workspace (vedlejší data, vedle zdroje)
+  extracts\                     <- NPZ cache extrahovaných příznaků
     m060-vel5-f48_chunk000.npz  <- audio + f0 + loudness_L/R + voiced_prob + vel_frames
     ...
-  checkpoints/
+  checkpoints\
     best.pt                     <- váhy modelu s nejnižší validační ztrátou
     last.pt                     <- váhy + stav optimalizátoru (pro resume)
-  generated/                    <- výstupní WAV soubory
   instrument.json               <- konfigurace a stav trénování
   train.log                     <- log epocha po epochě
 ```
 
-Zdrojový adresář `<instrument>/` je nikdy nemodifikován.
+Zdrojový adresář je nikdy nemodifikován.
+Workspace lze přepsat parametrem `--workspace <cesta>` — užitečné pokud
+zdrojová data změnila umístění, ale extracts/checkpoints zůstaly na místě.
 
 ---
 
 ## Datový tok
 
 ```
-Zdrojove WAV soubory
+C:\SoundBanks\ddsp\<nastroj>\   (zdrojove WAV, READ-ONLY)
         |
         v  [extract_and_cache]
         |  pyin F0 extrakce
@@ -249,6 +265,10 @@ Stereo audio (B, 2, T*HOP)
         v  [mrstft_loss + 0.2 * L1]
         |
 Gradient -> Adam -> aktualizace vah
+        |
+        v  [generate]
+        |
+C:\SoundBanks\IthacaPlayer\<nastroj>\   (vygenerovane WAV pro IthacaPlayer)
 ```
 
 ---

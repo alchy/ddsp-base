@@ -46,6 +46,30 @@ Podrobna architektura je v `docs/ARCHITECTURE.md`.
 
 ---
 
+## Adresarova struktura
+
+```
+C:\SoundBanks\
+  ddsp\
+    <nastroj>\          <- zdrojove WAV soubory (READ-ONLY vstup pro trenovani)
+  SFZ\
+    <nastroj>\          <- puvodni SFZ banky (READ-ONLY)
+  IthacaPlayer\
+    <nastroj>\          <- vygenerovane vzorky (vystup, prehrava IthacaPlayer)
+
+<nastroj>-ddsp\         <- workspace (vedlejsi data, vedle zdroje)
+  extracts\             <- NPZ cache
+  checkpoints\          <- best.pt, last.pt
+  instrument.json
+  train.log
+```
+
+Zdrojovy adresar je nikdy nemodifikovan. Workspace lze predat parametrem
+`--workspace <cesta>` — uzitecne pokud se zdroj presunul, ale extracts/checkpoints
+zustaly na puvodnim miste.
+
+---
+
 ## Rychly start
 
 Tri prikazy pro prvni pouziti:
@@ -55,17 +79,17 @@ Tri prikazy pro prvni pouziti:
 pip install -r requirements.txt
 
 # 2. Extrakce priznaku ze zdrojovych WAV
-python ddsp.py extract --instrument C:\samples\rhodes
+python ddsp.py extract --instrument C:\SoundBanks\ddsp\vintage-vibe
 
 # 3. Trenovani (auto-spusti extrakci pokud chybi)
-python ddsp.py learn --instrument C:\samples\rhodes --model small --epochs 100
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\vintage-vibe --model small --epochs 100
 
-# 4. Generovani vzorku
-python ddsp.py generate --instrument C:\samples\rhodes
+# 4. Generovani vzorku -> automaticky do C:\SoundBanks\IthacaPlayer\vintage-vibe\
+python ddsp.py generate --instrument C:\SoundBanks\ddsp\vintage-vibe
 ```
 
-Vysledek: adresa `C:\samples\rhodes-ddsp\generated\` obsahuje syntezovane WAV soubory
-se stejnymi nazvy jako originaly.
+Vysledek: `C:\SoundBanks\IthacaPlayer\vintage-vibe\` obsahuje syntezovane WAV soubory
+pripravene pro IthacaPlayer.
 
 > Tip: graficke rozhrani spustite prikazem `python gui.py`. Otevre se v prohlizeci na `http://127.0.0.1:7860`.
 
@@ -88,17 +112,22 @@ pip install -r requirements.txt
 
 ### 2. Priprava zdrojovych souboru
 
-Zdrojovy adresar musi obsahovat WAV soubory. Doporuceny format nazvu:
+Zdrojovy adresar uloz do `C:\SoundBanks\ddsp\<jmeno-nastroje>\`.
+Doporuceny format nazvu souboru:
 
 ```
 m060-vel5-f48.wav     # MIDI 60 (C4), velocity vrstva 5, 48 kHz
 m060-vel7-f48.wav     # MIDI 60 (C4), velocity vrstva 7 (forte)
 ```
 
-Soubory bez velocity v nazvu jsou podporovany — velocity se odhadne dynamicky
-z hlasitosti. Podpora formatu MP3, FLAC a OGG je k dispozici pres `extract`.
+Mas-li SFZ banku (Salamander, Piano in 162 apod.), uloz ji do
+`C:\SoundBanks\SFZ\<jmeno>\` a prevez pomoci:
 
-> **Pozor:** zdrojovy adresar je vzdy jen ke cteni. Vsechny vystupy jdou do `<nastroj>-ddsp/`.
+```bash
+python sfz_convert.py C:\SoundBanks\SFZ\<jmeno>\*.sfz C:\SoundBanks\ddsp\<jmeno>
+```
+
+> **Pozor:** zdrojovy adresar je vzdy jen ke cteni. Vsechny podporne vystupy jdou do `<nastroj>-ddsp/`.
 
 ### 3. Extrakce priznaku
 
@@ -244,8 +273,11 @@ Log se aktualizuje kazdé 2 sekundy. Tlacitko Stop prerusi beh prikazu.
 |--------|-------|
 | `extract` | Extrahuje a cachuje priznaky ze zdrojovych WAV |
 | `learn` | Trenuje model (auto-spusti extract pokud chybi NPZ) |
-| `generate` | Generuje WAV banka z nauceneho modelu |
+| `generate` | Generuje WAV banka -> `C:\SoundBanks\IthacaPlayer\<nastroj>\` |
 | `status` | Zobrazi stav nastroje |
+
+Vsechny prikazy podporuji `--workspace <cesta>` pro override umisteni
+extracts/checkpoints (uzitecne po presunuti zdrojovych dat).
 
 ### Parametry `learn`
 
@@ -265,7 +297,7 @@ Log se aktualizuje kazdé 2 sekundy. Tlacitko Stop prerusi beh prikazu.
 | `--wet` | `1.0` | Pomer DDSP / original (0.0–1.0) |
 | `--notes` | vse | Filtr not, napr. `C4 A3 G3` |
 | `--vel` | vse | Filtr velocity vrstev, napr. `5 7` |
-| `--output` | `<nastroj>-ddsp/generated/` | Vystupni adresar |
+| `--output` | `C:\SoundBanks\IthacaPlayer\<nastroj>` | Vystupni adresar |
 | `--no-skip` | off | Prepsat existujici soubory |
 
 ### Velikosti modelu
@@ -294,7 +326,11 @@ Soubory bez tohoto formatu jsou podporovany — velocity se odhadne automaticky.
 <nastroj>-ddsp/
   extracts/          NPZ cache (audio + f0 + loudness_L/R + voiced_prob + vel_frames)
   checkpoints/       best.pt, last.pt
-  generated/         vystupni WAV soubory
   instrument.json    konfigurace a stav
   train.log          log trenovani
+```
+
+Vygenerovane vzorky nejdou do workspace, ale primo do IthacaPlayer:
+```
+C:\SoundBanks\IthacaPlayer\<nastroj>\   <- vystup generate
 ```

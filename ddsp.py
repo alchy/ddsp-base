@@ -7,14 +7,19 @@ Usage:
     python ddsp.py generate  --instrument <path> [--wet 1.0]
     python ddsp.py status    --instrument <path>
 
-Directory layout (auto-created, instrument dir is READ-ONLY):
-    <instrument>/        ← source WAV files  (input, not modified)
-    <instrument>-ddsp/
-      extracts/          ← cached NPZ features
-      checkpoints/       ← best.pt, last.pt
-      generated/         ← output WAV files
-      instrument.json    ← config & training status
-      train.log          ← training log
+Directory layout:
+    Source samples (READ-ONLY):
+        C:\\SoundBanks\\ddsp\\<instrument>\\   ← mXXX-velX-fXX.wav + instrument-definition.json
+
+    Workspace (auto-created next to source, or --workspace override):
+        <instrument>-ddsp\\
+          extracts\\          ← cached NPZ features
+          checkpoints\\       ← best.pt, last.pt
+          instrument.json    ← config & training status
+          train.log          ← training log
+
+    Generated output (IthacaPlayer):
+        C:\\SoundBanks\\IthacaPlayer\\<instrument>\\   ← synthesized WAV bank
 """
 
 from __future__ import annotations
@@ -43,6 +48,9 @@ from model_ddsp import (
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
 
 CROP_FRAMES = 50   # 0.25 s of frames per training window
+
+# IthacaPlayer output root — generated sample banks land here
+ITHACA_PLAYER_ROOT = os.environ.get('ITHACA_ROOT', r'C:\SoundBanks\IthacaPlayer')
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +82,12 @@ class Workspace:
             os.makedirs(d, exist_ok=True)
 
 
-def make_workspace(instrument: str) -> Workspace:
+def make_workspace(instrument: str, workspace: str = None) -> Workspace:
     source_dir = os.path.abspath(instrument)
-    work_dir   = source_dir.rstrip('/\\') + '-ddsp'
+    if workspace:
+        work_dir = os.path.abspath(workspace)
+    else:
+        work_dir = source_dir.rstrip('/\\') + '-ddsp'
     return Workspace(source_dir=source_dir, work_dir=work_dir)
 
 
@@ -377,7 +388,7 @@ def synthesize(model: DDSPVocoder, midi: int, velocity: float,
 # ---------------------------------------------------------------------------
 
 def cmd_extract(args):
-    ws = make_workspace(args.instrument)
+    ws = make_workspace(args.instrument, getattr(args, "workspace", None))
     ws.makedirs()
     print(f'[ddsp extract]  source  -> {ws.source_dir}')
     print(f'                cache   -> {ws.extracts_dir}')
@@ -394,7 +405,7 @@ def cmd_extract(args):
 # ---------------------------------------------------------------------------
 
 def cmd_learn(args):
-    ws = make_workspace(args.instrument)
+    ws = make_workspace(args.instrument, getattr(args, "workspace", None))
     ws.makedirs()
 
     cfg = load_config(ws)
@@ -507,7 +518,7 @@ def cmd_learn(args):
 # ---------------------------------------------------------------------------
 
 def cmd_generate(args):
-    ws = make_workspace(args.instrument)
+    ws = make_workspace(args.instrument, getattr(args, "workspace", None))
 
     cfg       = load_config(ws)
     model_size = cfg.get('model_size', 'small')
@@ -542,7 +553,8 @@ def cmd_generate(args):
         vel_set   = set(args.vel)
         wav_files = [f for f in wav_files if (parse_filename(f) or [0, None])[1] in vel_set]
 
-    output_dir = args.output or ws.generated_dir
+    ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
+    output_dir = args.output or ithaca_out
     output_dir = output_dir if os.path.isabs(output_dir) else os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     wet   = float(np.clip(args.wet, 0.0, 1.0))
@@ -591,7 +603,7 @@ def cmd_generate(args):
 # ---------------------------------------------------------------------------
 
 def cmd_status(args):
-    ws  = make_workspace(args.instrument)
+    ws  = make_workspace(args.instrument, getattr(args, 'workspace', None))
     cfg = load_config(ws)
 
     def tick(cond): return 'ok' if cond else '--'
@@ -634,10 +646,13 @@ def main():
     )
     subs = parser.add_subparsers(dest='command', required=True)
 
+    _ws_help = 'Workspace directory for extracts/checkpoints (default: <instrument>-ddsp/)'
+
     # --- extract ---
     p_ext = subs.add_parser('extract', help='Extract & cache audio features')
     p_ext.add_argument('--instrument', required=True, metavar='DIR',
                        help='Source instrument directory (READ-ONLY)')
+    p_ext.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
     p_ext.add_argument('--chunk-sec', type=int, default=60, metavar='SEC',
                        dest='chunk_sec',
                        help='Split long files into chunks of SEC seconds (0=off, default: 60)')
@@ -645,8 +660,9 @@ def main():
     # --- learn ---
     p_lrn = subs.add_parser('learn', help='Train model (runs extract if needed)')
     p_lrn.add_argument('--instrument', required=True, metavar='DIR')
+    p_lrn.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
     p_lrn.add_argument('--model', choices=list(MODEL_SIZES), default=None,
-                       help='Model size: small (~84K), medium (~400K), large (~1.9M)')
+                       help='Model size: small (~115K), medium (~452K), large (~1.99M)')
     p_lrn.add_argument('--epochs',     type=int,   default=100)
     p_lrn.add_argument('--lr',         type=float, default=3e-4)
     p_lrn.add_argument('--resume',     action='store_true',
@@ -658,10 +674,11 @@ def main():
     # --- generate ---
     p_gen = subs.add_parser('generate', help='Generate sample bank from trained model')
     p_gen.add_argument('--instrument', required=True, metavar='DIR')
+    p_gen.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
     p_gen.add_argument('--wet',     type=float, default=1.0, metavar='0-1',
                        help='Wet/dry blend: 1.0=full DDSP, 0.0=original (default: 1.0)')
     p_gen.add_argument('--output',  default=None, metavar='DIR',
-                       help='Output directory (default: <instrument>-ddsp/generated/)')
+                       help=f'Output directory (default: {ITHACA_PLAYER_ROOT}\\<instrument>)')
     p_gen.add_argument('--notes',   nargs='+', default=None, metavar='NOTE',
                        help='Generate only these notes, e.g. --notes C4 A3 G3')
     p_gen.add_argument('--vel',     nargs='+', type=int, default=None, metavar='VEL',
@@ -672,6 +689,7 @@ def main():
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
     p_sts.add_argument('--instrument', required=True, metavar='DIR')
+    p_sts.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
 
     args = parser.parse_args()
 
