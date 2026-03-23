@@ -4,9 +4,6 @@ DDSP Neural Vocoder se naučí timbre monofónního nástroje z WAV vzorků
 a syntetizuje nové vzorky podmíněné trojicí (F0, hlasitost, velocity).
 Výstupem je stereo WAV banka kompatibilní se samplerovými pluginy (Kontakt, sfz).
 
-Určeno pro: zvukové designéry, výzkumníky a vývojáře, kteří potřebují rychle
-vytrénovat timbrový model z existujících nahrávek bez ručního anotování.
-
 Závislosti: Python 3.10+, PyTorch ≥ 2.0, librosa ≥ 0.10, soundfile ≥ 0.12.
 GPU není nutné — model `small` trénuje na CPU za přijatelnou dobu.
 
