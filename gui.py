@@ -190,13 +190,104 @@ def build_ui():
                 ext_stop.click(fn=stop_command, outputs=ext_log)
                 ext_timer.tick(fn=poll_log,     outputs=ext_log)
 
+            # -- Tab: EnvelopeNet --
+            with gr.Tab('EnvelopeNet'):
+                gr.Markdown(
+                    '### Trenovani EnvelopeNet\n'
+                    'Mala MLP (~30K param) ktera se uci tvar hlasitostni obalky z NPZ dat.\n'
+                    '**Vstup:** (midi, velocity)  **Vystup:** tvar obalky + delka tonu\n\n'
+                    'Pouziva warped casovou osu (power-law) pro jemne rozliseni attack faze '
+                    '(~2 ms v prvnich 500 ms), a vazeny MSE loss pro zdurazneni attacku.\n'
+                    '**Spust pred DDSP Model** (coupled mode) nebo samostatne kdykoli.'
+                )
+                env_status_out   = gr.Textbox(label='Stav EnvelopeNet', lines=2,
+                                              interactive=False, max_lines=2)
+                env_status_timer = gr.Timer(value=5)
+
+                def read_env_status(instrument, workspace):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    env_pt   = os.path.join(work_dir, 'checkpoints', 'envelope.pt')
+                    if not os.path.exists(env_pt):
+                        return 'Nenatrenovano — envelope.pt neexistuje.'
+                    mb = os.path.getsize(env_pt) / 1e6
+                    ts = time.strftime('%Y-%m-%d %H:%M',
+                                       time.localtime(os.path.getmtime(env_pt)))
+                    try:
+                        import torch as _torch
+                        ckpt   = _torch.load(env_pt, map_location='cpu', weights_only=True)
+                        n_env  = ckpt.get('n_env', '?')
+                        warp   = ckpt.get('warp', '?')
+                        detail = f'n_env={n_env}  warp={warp}'
+                    except Exception:
+                        detail = '(nelze nacist detail)'
+                    return (f'HOTOVO  {detail}  [{ts}]\n'
+                            f'checkpoint: {env_pt}  ({mb:.2f} MB)')
+
+                env_status_timer.tick(fn=read_env_status,
+                                      inputs=[instrument_in, workspace_in],
+                                      outputs=env_status_out)
+                instrument_in.change(fn=read_env_status,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=env_status_out)
+                workspace_in.change(fn=read_env_status,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=env_status_out)
+
+                with gr.Row():
+                    env_epochs_sl = gr.Slider(100, 5000, value=1000, step=100,
+                                              label='Pocet epoch',
+                                              info='1000 epoch staci pro vetsinu nastroju; '
+                                                   'zvys pro komplexnejsi obalky')
+                    env_lr_sl     = gr.Slider(1e-5, 1e-2, value=1e-3, step=1e-5,
+                                              label='Learning rate',
+                                              info='Doporuceno: 1e-3')
+                with gr.Row():
+                    env_warp_sl   = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                              label='Envelope Warp',
+                                              info='Stupen koncentrace bodu na zacatku obalky. '
+                                                   '4.0 = prvni polovina bodu pokryva prvnich 6% '
+                                                   'tonu (attack). Vys = jemnejsi attack rozliseni.')
+                    env_nenv_sl   = gr.Slider(128, 1024, value=512, step=64,
+                                              label='N ENV (pocet ridicicich bodu)',
+                                              info='Pocet bodu na warped ose. 512 = ~30K param.')
+                    env_atk_w_sl  = gr.Slider(1.0, 20.0, value=5.0, step=0.5,
+                                              label='Attack weight (MSE)',
+                                              info='Nasobitel chyby v attack oblasti (prvni ~4% '
+                                                   'bodu). 5.0 = attack prispiva 5x vice do loss.')
+                with gr.Row():
+                    env_run  = gr.Button('Spustit trenovani EnvelopeNet', variant='primary')
+                    env_stop = gr.Button('Stop')
+                env_log   = gr.Textbox(label='Vystup', lines=15, interactive=False)
+                env_timer = gr.Timer(value=2)
+
+                def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                    args = ['learn-envelope', '--instrument', instrument,
+                            '--epochs', str(int(epochs)),
+                            '--lr', f'{lr:.2e}',
+                            '--envelope-warp', f'{warp:.2f}',
+                            '--n-env', str(int(n_env)),
+                            '--attack-weight', f'{atk_w:.2f}']
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
+                    return run_command(args, env_log)
+
+                env_run.click(fn=run_learn_envelope,
+                               inputs=[instrument_in, workspace_in, env_epochs_sl,
+                                       env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl],
+                               outputs=env_log)
+                env_stop.click(fn=stop_command, outputs=env_log)
+                env_timer.tick(fn=poll_log, outputs=env_log)
+
             # -- Tab: DDSP Model --
             with gr.Tab('DDSP Model'):
                 gr.Markdown(
                     '### Trenovani DDSP modelu\n'
                     'Ucí se syntetizovat timbre nastroje z extrakci (F0, hlasitost, velocity). '
                     'Extrakce probehne automaticky pokud chybi. '
-                    'Po skonceni se spusti **EnvelopeNet** automaticky (viz zalozka EnvelopeNet).'
+                    'V **coupled mode** natrénuje EnvelopeNet automaticky jako první krok.'
                 )
                 ddsp_status_out   = gr.Textbox(label='Stav modelu', lines=2,
                                                interactive=False, max_lines=2)
@@ -308,97 +399,6 @@ def build_ui():
                 workspace_in.change(fn=read_train_log,
                                     inputs=[instrument_in, workspace_in],
                                     outputs=trainlog_out)
-
-            # -- Tab: EnvelopeNet --
-            with gr.Tab('EnvelopeNet'):
-                gr.Markdown(
-                    '### Trenovani EnvelopeNet\n'
-                    'Mala MLP (~30K param) ktera se uci tvar hlasitostni obalky z NPZ dat.\n'
-                    '**Vstup:** (midi, velocity)  **Vystup:** tvar obalky + delka tonu\n\n'
-                    'Pouziva warped casovou osu (power-law) pro jemne rozliseni attack faze '
-                    '(~2 ms v prvnich 500 ms), a vazeny MSE loss pro zdurazneni attacku.\n'
-                    'Tréning je rychly (~minuty) a spusti se automaticky na konci `DDSP Model`.'
-                )
-                env_status_out   = gr.Textbox(label='Stav EnvelopeNet', lines=2,
-                                              interactive=False, max_lines=2)
-                env_status_timer = gr.Timer(value=5)
-
-                def read_env_status(instrument, workspace):
-                    if not instrument:
-                        return 'Zadejte adresar nastroje.'
-                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
-                    env_pt   = os.path.join(work_dir, 'checkpoints', 'envelope.pt')
-                    if not os.path.exists(env_pt):
-                        return 'Nenatrenovano — envelope.pt neexistuje.'
-                    mb = os.path.getsize(env_pt) / 1e6
-                    ts = time.strftime('%Y-%m-%d %H:%M',
-                                       time.localtime(os.path.getmtime(env_pt)))
-                    try:
-                        import torch as _torch
-                        ckpt   = _torch.load(env_pt, map_location='cpu', weights_only=True)
-                        n_env  = ckpt.get('n_env', '?')
-                        warp   = ckpt.get('warp', '?')
-                        detail = f'n_env={n_env}  warp={warp}'
-                    except Exception:
-                        detail = '(nelze nacist detail)'
-                    return (f'HOTOVO  {detail}  [{ts}]\n'
-                            f'checkpoint: {env_pt}  ({mb:.2f} MB)')
-
-                env_status_timer.tick(fn=read_env_status,
-                                      inputs=[instrument_in, workspace_in],
-                                      outputs=env_status_out)
-                instrument_in.change(fn=read_env_status,
-                                     inputs=[instrument_in, workspace_in],
-                                     outputs=env_status_out)
-                workspace_in.change(fn=read_env_status,
-                                    inputs=[instrument_in, workspace_in],
-                                    outputs=env_status_out)
-
-                with gr.Row():
-                    env_epochs_sl = gr.Slider(100, 5000, value=1000, step=100,
-                                              label='Pocet epoch',
-                                              info='1000 epoch staci pro vetsinu nastroju; '
-                                                   'zvys pro komplexnejsi obalky')
-                    env_lr_sl     = gr.Slider(1e-5, 1e-2, value=1e-3, step=1e-5,
-                                              label='Learning rate',
-                                              info='Doporuceno: 1e-3')
-                with gr.Row():
-                    env_warp_sl   = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
-                                              label='Envelope Warp',
-                                              info='Stupen koncentrace bodu na zacatku obalky. '
-                                                   '4.0 = prvni polovina bodu pokryva prvnich 6% '
-                                                   'tonu (attack). Vys = jemnejsi attack rozliseni.')
-                    env_nenv_sl   = gr.Slider(128, 1024, value=512, step=64,
-                                              label='N ENV (pocet ridicicich bodu)',
-                                              info='Pocet bodu na warped ose. 512 = ~30K param.')
-                    env_atk_w_sl  = gr.Slider(1.0, 20.0, value=5.0, step=0.5,
-                                              label='Attack weight (MSE)',
-                                              info='Nasobitel chyby v attack oblasti (prvni ~4% '
-                                                   'bodu). 5.0 = attack prispiva 5x vice do loss.')
-                with gr.Row():
-                    env_run  = gr.Button('Spustit trenovani EnvelopeNet', variant='primary')
-                    env_stop = gr.Button('Stop')
-                env_log   = gr.Textbox(label='Vystup', lines=15, interactive=False)
-                env_timer = gr.Timer(value=2)
-
-                def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w):
-                    if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
-                    args = ['learn-envelope', '--instrument', instrument,
-                            '--epochs', str(int(epochs)),
-                            '--lr', f'{lr:.2e}',
-                            '--envelope-warp', f'{warp:.2f}',
-                            '--n-env', str(int(n_env)),
-                            '--attack-weight', f'{atk_w:.2f}']
-                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
-                    return run_command(args, env_log)
-
-                env_run.click(fn=run_learn_envelope,
-                               inputs=[instrument_in, workspace_in, env_epochs_sl,
-                                       env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl],
-                               outputs=env_log)
-                env_stop.click(fn=stop_command, outputs=env_log)
-                env_timer.tick(fn=poll_log, outputs=env_log)
 
             # -- Tab: Generovani --
             with gr.Tab('Generovani'):
