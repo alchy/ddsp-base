@@ -192,6 +192,21 @@ def build_ui():
                     if workspace.strip(): args += ['--workspace', workspace.strip()]
                     return run_command(args, lrn_log)
 
+                gr.Markdown('### train.log')
+                trainlog_out  = gr.Textbox(label='train.log (posledních 60 řádků)',
+                                           lines=12, interactive=False, max_lines=12)
+                trainlog_timer = gr.Timer(value=3)
+
+                def read_train_log(instrument, workspace):
+                    name     = os.path.basename((instrument or '').rstrip('/\\'))
+                    work_dir = workspace.strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    log_path = os.path.join(work_dir, 'train.log')
+                    if not os.path.exists(log_path):
+                        return '(train.log nenalezen)'
+                    with open(log_path, encoding='utf-8', errors='replace') as f:
+                        lines = f.readlines()
+                    return ''.join(lines[-60:])
+
                 lrn_run.click(fn=run_learn,
                                inputs=[instrument_in, workspace_in, model_size, epochs_sl, lr_sl, resume_chk],
                                outputs=lrn_log)
@@ -200,6 +215,15 @@ def build_ui():
                                outputs=lrn_log)
                 lrn_stop.click(fn=stop_command, outputs=lrn_log)
                 lrn_timer.tick(fn=poll_log,     outputs=lrn_log)
+                trainlog_timer.tick(fn=read_train_log,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=trainlog_out)
+                instrument_in.change(fn=read_train_log,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=trainlog_out)
+                workspace_in.change(fn=read_train_log,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=trainlog_out)
 
             # -- Tab: Generovani --
             with gr.Tab('Generovani'):
