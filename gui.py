@@ -107,7 +107,7 @@ def build_ui():
     def poll_log():
         return '\n'.join(_current['log'][-200:])
 
-    with gr.Blocks(title='DDSP Neural Vocoder', theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title='DDSP Neural Vocoder') as app:
         gr.Markdown('# DDSP Neural Vocoder\nUceni timbru nastroje a generovani vzorku.')
 
         with gr.Tabs():
@@ -412,16 +412,6 @@ def build_ui():
                             f'posledni zmena [{ts}]\n'
                             f'vystup: {out_dir}')
 
-                gen_status_timer.tick(fn=read_gen_status,
-                                      inputs=[instrument_in, workspace_in, output_in],
-                                      outputs=gen_status_out)
-                instrument_in.change(fn=read_gen_status,
-                                     inputs=[instrument_in, workspace_in, output_in],
-                                     outputs=gen_status_out)
-                workspace_in.change(fn=read_gen_status,
-                                    inputs=[instrument_in, workspace_in, output_in],
-                                    outputs=gen_status_out)
-
                 with gr.Row():
                     full_range_chk = gr.Checkbox(
                         label='Full-range mod (kompletni chromaticka banka)',
@@ -510,6 +500,16 @@ def build_ui():
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
                 gen_timer.tick(fn=poll_log, outputs=gen_log)
+                # gen_status wiring — output_in must be defined first
+                gen_status_timer.tick(fn=read_gen_status,
+                                      inputs=[instrument_in, workspace_in, output_in],
+                                      outputs=gen_status_out)
+                instrument_in.change(fn=read_gen_status,
+                                     inputs=[instrument_in, workspace_in, output_in],
+                                     outputs=gen_status_out)
+                workspace_in.change(fn=read_gen_status,
+                                    inputs=[instrument_in, workspace_in, output_in],
+                                    outputs=gen_status_out)
                 output_in.change(fn=read_gen_status,
                                  inputs=[instrument_in, workspace_in, output_in],
                                  outputs=gen_status_out)
@@ -526,7 +526,7 @@ def main():
 
     app = build_ui()
     app.launch(server_name=args.host, server_port=args.port, share=args.share,
-               inbrowser=True)
+               inbrowser=True, theme=gr.themes.Soft())
 
 
 if __name__ == '__main__':
