@@ -370,6 +370,25 @@ def adsr_loudness(n_frames: int, peak_db=-6.0, atk_ms=10.0, dec_ms=200.0,
     if rel_f: lo[e2:e3]  = np.linspace(sus_db, -80.0, rel_f)
     return lo
 
+def piano_adsr(midi: int, vel_layer: int, n_vel: int, duration_s: float) -> np.ndarray:
+    """
+    Synthetic piano-style ADSR loudness envelope conditioned on MIDI note and velocity.
+
+    Higher velocity  -> louder peak
+    Lower MIDI note  -> longer decay and release (strings vibrate longer)
+    """
+    n_frames  = math.ceil(duration_s * SR / FRAME_HOP)
+    # Velocity -> peak dB: vel 0 = -32 dB, vel N-1 = -6 dB
+    peak_db   = -32.0 + vel_layer * 26.0 / max(n_vel - 1, 1)
+    sus_db    = peak_db - 9.0
+    # Decay/release: longer for low notes (MIDI 21 -> long, MIDI 108 -> short)
+    t         = np.clip((midi - 21) / (108 - 21), 0.0, 1.0)
+    dec_ms    = 1200.0 - t * 900.0    # 1200 ms (bass) -> 300 ms (treble)
+    rel_ms    = 800.0  - t * 600.0    # 800 ms (bass)  -> 200 ms (treble)
+    return adsr_loudness(n_frames, peak_db=peak_db, atk_ms=8.0,
+                         dec_ms=dec_ms, sus_db=sus_db, rel_ms=rel_ms)
+
+
 @torch.no_grad()
 def synthesize(model: DDSPVocoder, midi: int, velocity: float,
                loudness: np.ndarray, device: torch.device) -> np.ndarray:
@@ -557,11 +576,68 @@ def cmd_generate(args):
     output_dir = args.output or ithaca_out
     output_dir = output_dir if os.path.isabs(output_dir) else os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    skip = not args.no_skip
+
+    # ------------------------------------------------------------------ #
+    # Full-range mode: generate complete chromatic bank from model alone  #
+    # ------------------------------------------------------------------ #
+    if getattr(args, 'full_range', False):
+        midi_lo   = args.midi_lo
+        midi_hi   = args.midi_hi
+        n_vel     = args.vel_layers
+        dur_s     = args.duration
+        sr_kHz    = SR // 1000
+        midi_list = list(range(midi_lo, midi_hi + 1))
+        total     = len(midi_list) * n_vel
+
+        print(f'[ddsp generate]  FULL RANGE  {midi_to_name(midi_lo)}-{midi_to_name(midi_hi)}'
+              f'  ({len(midi_list)} notes x {n_vel} vel = {total} samples)')
+        print(f'                 duration={dur_s}s  output->{output_dir}\n')
+
+        done = 0
+        for midi in midi_list:
+            freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
+            for vel in range(n_vel):
+                out_name = f'm{midi:03d}-vel{vel}-f{sr_kHz}.wav'
+                out_path = os.path.join(output_dir, out_name)
+                if skip and os.path.exists(out_path):
+                    done += 1; continue
+                try:
+                    loudness = piano_adsr(midi, vel, n_vel, dur_s)
+                    audio    = synthesize(model, midi, float(vel), loudness, device)
+                    save_wav(out_path, audio, SR)
+                    done += 1
+                    print(f'  {midi_to_name(midi):4s} m{midi:03d} vel{vel}  {freq:.1f}Hz  -> {out_name}')
+                except Exception as exc:
+                    print(f'  ERROR m{midi:03d} vel{vel}: {exc}')
+
+        # Copy instrument-definition.json if present in source
+        idef_src = os.path.join(ws.source_dir, 'instrument-definition.json')
+        if os.path.exists(idef_src):
+            idef_dst = os.path.join(output_dir, 'instrument-definition.json')
+            import json as _json
+            with open(idef_src, encoding='utf-8') as f:
+                idef = _json.load(f)
+            idef['velocityMaps'] = str(n_vel)
+            idef['sampleCount']  = len(midi_list)
+            with open(idef_dst, 'w', encoding='utf-8') as f:
+                _json.dump(idef, f, indent=4, ensure_ascii=False)
+
+        print(f'\n[ddsp generate]  done: {done}/{total}  -> {output_dir}')
+        cfg.update({'generated': {'n_files': done, 'mode': 'full_range',
+                                   'midi_range': f'{midi_lo}-{midi_hi}',
+                                   'vel_layers': n_vel, 'output_dir': output_dir,
+                                   'generated_at': _now()}})
+        save_config(ws, cfg)
+        return
+
+    # ------------------------------------------------------------------ #
+    # Standard mode: one output per source WAV                            #
+    # ------------------------------------------------------------------ #
     wet   = float(np.clip(args.wet, 0.0, 1.0))
     total = len(wav_files)
     print(f'[ddsp generate]  {total} sample(s)  wet={wet:.2f}  output->{output_dir}\n')
 
-    skip = not args.no_skip
     done = 0
     for idx, wav_path in enumerate(wav_files):
         out_name = os.path.basename(wav_path)
@@ -685,6 +761,17 @@ def main():
                        help='Velocity filter, e.g. --vel 5 7')
     p_gen.add_argument('--no-skip', action='store_true', dest='no_skip',
                        help='Overwrite existing output files')
+    # Full-range mode
+    p_gen.add_argument('--full-range', action='store_true', dest='full_range',
+                       help='Generate complete chromatic bank without source WAVs')
+    p_gen.add_argument('--midi-lo', type=int, default=21, dest='midi_lo', metavar='MIDI',
+                       help='Lowest MIDI note for --full-range (default: 21 = A0)')
+    p_gen.add_argument('--midi-hi', type=int, default=108, dest='midi_hi', metavar='MIDI',
+                       help='Highest MIDI note for --full-range (default: 108 = C8)')
+    p_gen.add_argument('--vel-layers', type=int, default=8, dest='vel_layers', metavar='N',
+                       help='Number of velocity layers for --full-range (default: 8)')
+    p_gen.add_argument('--duration', type=float, default=4.0, metavar='SEC',
+                       help='Note duration in seconds for --full-range (default: 4.0)')
 
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
