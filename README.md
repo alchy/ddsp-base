@@ -308,6 +308,21 @@ extracts/checkpoints (uzitecne po presunuti zdrojovych dat).
 | `medium` | ~452 K | 128 | 2 | 256 |
 | `large` | ~1.99 M | 256 | 3 | 512 |
 
+### Identifikace nastroje
+
+Jmeno adresare v `C:\SoundBanks\ddsp\` je master identifikator nastroje.
+Od nej se odviji vsechny ostatni cesty automaticky:
+
+```
+--instrument C:\SoundBanks\ddsp\vintage-vibe
+                                 ^^^^^^^^^^^
+                                 |
+                                 +-- workspace:  C:\SoundBanks\ddsp\vintage-vibe-ddsp\
+                                 +-- IthacaPlayer: C:\SoundBanks\IthacaPlayer\vintage-vibe\
+```
+
+Pojmenuj adresar jednou spravne — vse ostatni se odvodi samo.
+
 ### Format nazvu souboru
 
 ```
