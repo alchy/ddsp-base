@@ -1,0 +1,12 @@
+{
+  "_comment": "DDSP Neural Vocoder — default config. All keys are optional. See docs/ARCHITECTURE.md.",
+
+  "_model_sizes": "Override model size preset (small/medium/large) with custom values",
+  "gru_hidden": 64,
+  "gru_layers": 1,
+  "mlp_dim": 128,
+
+  "_training": "Training defaults (overridden by CLI --epochs / --lr)",
+  "epochs": 100,
+  "lr": 3e-4
+}
