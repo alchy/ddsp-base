@@ -95,14 +95,25 @@ loudness klesá → normální váha. Automaticky se přizpůsobí délce attack
 
 ```python
 # lo_db: (B, T) loudness z NPZ — již k dispozici v tréninku
-dl = torch.diff(lo_db, prepend=lo_db[:, :1], dim=1)   # dL/dt per frame
-dl = gaussian_smooth(dl, sigma=2)                       # vyhlazení — NPZ derivative je zašuměná
-attack_w = torch.clamp(dl * alpha, min=0.0) + 1.0      # alpha ~ 5–10, floor = 1.0 (nikdy < norm)
+
+# (1) Vyhlazení derivace — raw dL/dt z NPZ je zašuměná
+lo_smooth = gaussian_filter1d(lo_db, sigma=2, dim=-1)
+dl = torch.diff(lo_smooth, prepend=lo_smooth[:, :1], dim=1)
+
+# (2) Clamp + normalizace per sample — alpha má stabilní sémantiku napříč batchi
+dl_pos  = torch.clamp(dl, min=0.0)
+dl_norm = dl_pos / (dl_pos.amax(dim=1, keepdim=True) + 1e-6)   # [0, 1] per sample
+
+# (3) Hladké váhy, floor = 1.0 — váhy se aplikují na vstup MRSTFT, ne na loss číslo
+#     → STFT nesmí vidět ostré přechody váhy (artefakty)
+attack_w = 1.0 + alpha * dl_norm                                # alpha ≈ 3–5
 
 # Upsample na sample rate pro STFT loss
-attack_w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples, mode='linear')
+attack_w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples,
+                             mode='linear', align_corners=False).squeeze(1)
 
 # Loss: standard MRSTFT + attack-weighted term
+# Váhy na vstupu: mrstft(pred * w, target * w) — ne loss * w
 loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_w_up)
 ```
 
@@ -111,11 +122,12 @@ loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_
 - Treble (C7): attack ~10 ms → fixní 100 ms by tlačil na sustain zbytečně
 - Obálka to ví sama — adaptivní, bez nových hyperparametrů mimo `alpha` a `beta`
 
-**Výhrada**: `gaussian_smooth` nutný — raw derivace NPZ loudness je zašuměná,
-zejména v prvních framech. Bez vyhlazení → noisy gradient signal.
+**Tři klíčové implementační detaily** (potvrzeno odbornou konzultací):
+1. **Vyhlazení** (`gaussian_filter1d`, sigma≈2) — raw derivace NPZ je zašuměná; bez toho noisy gradient
+2. **Normalizace per sample** po clampu — `alpha` má pak stabilní sémantiku bez závislosti na absolutní loudnosti
+3. **Váhy na vstupu MRSTFT**, ne na loss hodnotě — proto musí být hladké; ostré přechody váhy = STFT artefakty
 
-**Parametry**: `alpha=5.0`, `beta=0.5` jako výchozí — attack frames dostanou
-~6× vyšší váhu než sustain, celková loss je součet obou termů.
+**Parametry**: konzervativní start `alpha=3–5`, `beta=0.25–0.5`.
 
 ---
 
