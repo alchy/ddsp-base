@@ -138,8 +138,8 @@ ale není součástí trénovací cesty.
 Dvouvrstvá MLP předpřipravuje příznaky před GRU:
 
 ```
-feat (B, T, 88)
-  -> Linear(88, mlp_dim) -> ReLU
+feat (B, T, 72)
+  -> Linear(72, mlp_dim) -> ReLU
   -> Linear(mlp_dim, mlp_dim) -> ReLU
   -> (B, T, mlp_dim)
 ```
@@ -348,7 +348,7 @@ ale při full-range generování dostane EnvelopeNet aproximaci (hladší, warpe
 Tento rozdíl je v praxi malý pro standardní mód (generate ze zdrojových WAV),
 ale může ovlivnit full-range mode.
 
-### Coupled (větev `dev`, příznak `--coupled`)
+### Coupled (příznak `--coupled`)
 
 ```
 NPZ extracts ──► EnvelopeNet trénink  (PRVNÍ)
@@ -381,10 +381,7 @@ Inference (full-range):
 # Decoupled (default)
 python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300
 
-# Coupled (dev branch)
+# Coupled
 python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300 \
     --coupled --env-mix 0.5
 ```
-
-V GUI (větev `dev`) je dostupný checkbox **"Coupled mode"** s posuvníkem **"EnvelopeNet mix"**
-v záložce **DDSP Model**.
