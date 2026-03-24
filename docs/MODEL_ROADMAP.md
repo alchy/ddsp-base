@@ -75,6 +75,50 @@ ale neadaptuje se na data. Vhodné jako baseline pro srovnání.
 
 ---
 
+### [dev-attack-loss] Attack-weighted loss pomocí obálky
+
+**Priorita**: vysoká — přímé řešení slabého bright attacku
+
+**Problém**:
+MRSTFT průměruje loss přes celý signál. Sustain trvá sekundy, attack 10–80 ms
+(C7 ≈ 10 ms, A0 ≈ 80 ms). Model minimalizuje loss tím, že se naučí sustain
+a attack „odpíše" — výsledek má správný pitch a sustain, ale slabé bright tóny při náběhu.
+
+Klíčové: model **kapacitně umí** generovat bright attack (softmax to nevylučuje),
+ale loss ho k tomu **netlačí**. Jde o problém tréninku, ne architektury.
+
+**Navrhované řešení**: váhování loss podle derivace obálky
+
+Místo fixního okna (100 ms) použít `dL/dt` — loudness roste → extra váha,
+loudness klesá → normální váha. Automaticky se přizpůsobí délce attacku per nota
+(basové struny vs. výšky).
+
+```python
+# lo_db: (B, T) loudness z NPZ — již k dispozici v tréninku
+dl = torch.diff(lo_db, prepend=lo_db[:, :1], dim=1)   # dL/dt per frame
+dl = gaussian_smooth(dl, sigma=2)                       # vyhlazení — NPZ derivative je zašuměná
+attack_w = torch.clamp(dl * alpha, min=0.0) + 1.0      # alpha ~ 5–10, floor = 1.0 (nikdy < norm)
+
+# Upsample na sample rate pro STFT loss
+attack_w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples, mode='linear')
+
+# Loss: standard MRSTFT + attack-weighted term
+loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_w_up)
+```
+
+**Proč obálka místo fixního okna**:
+- Bass (A0): attack ~80 ms → fixní 100 ms ok, ale přesah do decay
+- Treble (C7): attack ~10 ms → fixní 100 ms by tlačil na sustain zbytečně
+- Obálka to ví sama — adaptivní, bez nových hyperparametrů mimo `alpha` a `beta`
+
+**Výhrada**: `gaussian_smooth` nutný — raw derivace NPZ loudness je zašuměná,
+zejména v prvních framech. Bez vyhlazení → noisy gradient signal.
+
+**Parametry**: `alpha=5.0`, `beta=0.5` jako výchozí — attack frames dostanou
+~6× vyšší váhu než sustain, celková loss je součet obou termů.
+
+---
+
 ### [dev-noise-amp] Globální amplituda šumové složky
 
 **Priorita**: střední
@@ -110,8 +154,9 @@ celou šumovou složku, zatímco spektrální tvar (distribuce přes 129 binů) 
 ## Pořadí implementace
 
 1. **[dev-softmax]** — hotovo, testování (50 epoch small model)
-2. **[dev-inharmonicity]** — po dokončení dev-softmax testu
-3. **[dev-noise-amp]** — kombinovat s dev-inharmonicity nebo samostatně
+2. **[dev-attack-loss]** — po dokončení dev-softmax; řeší slabý bright attack (bez změny architektury)
+3. **[dev-inharmonicity]** — sustain realism, strunový charakter, beating
+4. **[dev-noise-amp]** — balance harm/noise, velocity energie; kombinovat s dev-inharmonicity
 
 ## Poznámky
 
