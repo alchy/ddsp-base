@@ -103,13 +103,12 @@ class HarmonicSynth(nn.Module):
     Output: (B, 1, n_samples)
     """
 
-    def forward(self, harm_amps, f0_hz, n_samples, inh=None):
+    def forward(self, harm_amps, f0_hz, n_samples, inh):
         """
         harm_amps : (B, T, N)
         f0_hz     : (B, T)
         n_samples : int
-        inh       : (B,) inharmonicity coefficient per item, or None (= pure harmonic)
-                    f_k = k · f0 · √(1 + inh · k²)
+        inh       : (B,)  inharmonicity coefficient — f_k = k · f0 · √(1 + inh · k²)
         """
         B, T_frames, N = harm_amps.shape
         device = harm_amps.device
@@ -119,19 +118,14 @@ class HarmonicSynth(nn.Module):
 
         k = torch.arange(1, N + 1, dtype=torch.float32, device=device)   # (N,)
 
-        if inh is not None:
-            # Piano inharmonicity: partial k is at k·f0·√(1 + inh·k²)
-            # inh: (B,) → (B, N)
-            stretch = torch.sqrt(1.0 + inh.unsqueeze(1) * k ** 2)        # (B, N)
-            # inst_freq: (B, N, n_samples)
-            inst_freq = f0_up.unsqueeze(1) * (k.unsqueeze(0) * stretch).unsqueeze(2)
-        else:
-            inst_freq = f0_up.unsqueeze(1) * k.unsqueeze(0).unsqueeze(2)
+        # Piano inharmonicity: partial k at k·f0·√(1 + inh·k²)
+        stretch   = torch.sqrt(1.0 + inh.unsqueeze(1) * k ** 2)          # (B, N)
+        inst_freq = f0_up.unsqueeze(1) * (k.unsqueeze(0) * stretch).unsqueeze(2)  # (B, N, n_samples)
 
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
-        # Phase accumulation: cumsum over instantaneous frequency (correct for time-varying F0)
+        # Phase accumulation: cumsum over instantaneous frequency
         phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
@@ -225,7 +219,7 @@ class DDSPVocoder(nn.Module):
         nn.init.constant_(self.head_noise_L.bias, -3.0)
         nn.init.constant_(self.head_noise_R.bias, -3.0)
 
-    def forward(self, f0_hz, loudness_db, velocity=None, n_frames=None):
+    def forward(self, f0_hz, loudness_db, velocity=None, n_frames=None, inh_scale=1.0):
         """
         f0_hz       : (B, T)  in Hz, 0 = unvoiced
         loudness_db : (B, T)  in dB (used as post-synthesis amplitude envelope)
@@ -261,7 +255,8 @@ class DDSPVocoder(nn.Module):
         f0_mean  = f0_hz.clamp(min=F0_MIN).mean(dim=1)                          # (B,)
         midi_est = 69.0 + 12.0 * torch.log2(f0_mean / 440.0)                   # (B,)
         b_max    = 0.0008 * torch.exp(-(midi_est - 21.0) / 88.0 * math.log(10.0))
-        inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) * b_max  # (B,)
+        inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) \
+                   * b_max * inh_scale                                           # (B,)
 
         n_samples   = n_frames * FRAME_HOP
         harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh)

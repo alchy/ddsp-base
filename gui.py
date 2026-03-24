@@ -463,6 +463,10 @@ def build_ui():
                                           label='Wet (jen standardni mod)',
                                           info='1.0 = plny DDSP vystup, 0.0 = original WAV, '
                                                '0.5 = mix. Jen pro standardni mod.')
+                    inh_scale_sl = gr.Slider(0.0, 2.0, value=1.0, step=0.1,
+                                             label='Inharmonicity scale',
+                                             info='0.0 = ciste harmonicke, 1.0 = naucene B, '
+                                                  '2.0 = zesilenа inharmonicita. Plati pro oba mody.')
                     notes_in = gr.Textbox(label='Noty (prazdne = vse, jen standardni mod)',
                                            placeholder='C4 A3 G3',
                                            info='Generovat jen tyto noty. Prazdne = vsechny.')
@@ -482,13 +486,14 @@ def build_ui():
                 gen_timer = gr.Timer(value=2)
 
                 def run_generate(instrument, workspace, full_range, midi_lo, midi_hi,
-                                 vel_layers, env_src, atk_ramp, wet, notes, vel,
-                                 output, no_skip_val, device):
+                                 vel_layers, env_src, atk_ramp, wet, inh_scale,
+                                 notes, vel, output, no_skip_val, device):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['generate', '--instrument', instrument,
                             '--envelope-source', env_src,
                             '--attack-ramp-ms', str(int(atk_ramp)),
+                            '--inharmonicity-scale', f'{inh_scale:.2f}',
                             '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if full_range:
@@ -508,8 +513,8 @@ def build_ui():
                                inputs=[instrument_in, workspace_in, full_range_chk,
                                        midi_lo_sl, midi_hi_sl, vel_layers_sl,
                                        env_source_radio, attack_ramp_sl,
-                                       wet_sl, notes_in, vel_in, output_in, no_skip,
-                                       device_dd],
+                                       wet_sl, inh_scale_sl, notes_in, vel_in,
+                                       output_in, no_skip, device_dd],
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
                 gen_timer.tick(fn=poll_log, outputs=gen_log)
