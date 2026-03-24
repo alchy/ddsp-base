@@ -70,8 +70,19 @@ inst_freq = f0_up.unsqueeze(1) * k * stretch.unsqueeze(2)
 - Každý nástroj (Salamander, vintage-vibe, …) má jiné B
 - Fixní fyzikální model by vyžadoval ruční kalibraci per-banka
 
-**Alternativa**: fixní `B(midi)` odvozené z frekvence — rychlejší implementace,
-ale neadaptuje se na data. Vhodné jako baseline pro srovnání.
+**Doporučený A/B experiment**:
+
+| Varianta | Popis | Kdy použít |
+|----------|-------|-----------|
+| A — fixed `B(midi)` | `B = B_0 · 2^((midi−69)/6)`, žádné nové params | baseline, ověření slyšitelnosti efektu |
+| B — learned scalar | `head_B → sigmoid → pool → B_MAX`, ~256 params | finální produkční model |
+
+Pokud fixed baseline (A) dá skoro stejný poslechový benefit jako learned (B),
+je levnější, stabilnější a interpretovatelný. Learned varianta je správný finální cíl.
+
+> **B_MAX = 0.0002** je konzervativní výchozí hodnota bezpečná pro celý rozsah.
+> Pro basové registry může být příliš těsná (slyšitelný efekt malý). Pokud branch funguje
+> ale efekt není slyšet, vyzkoušet `B_MAX = 0.0005–0.001` nebo MIDI-dependent prior.
 
 ---
 
@@ -127,7 +138,12 @@ loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_
 2. **Normalizace per sample** po clampu — `alpha` má pak stabilní sémantiku bez závislosti na absolutní loudnosti
 3. **Váhy na vstupu MRSTFT**, ne na loss hodnotě — proto musí být hladké; ostré přechody váhy = STFT artefakty
 
-**Parametry**: konzervativní start `alpha=3–5`, `beta=0.25–0.5`.
+**Parametry**: doporučený start `alpha=4.0`, `beta=0.3`.
+
+> **Scope tohoto kroku**: dev-attack-loss řeší *underweighted onset energy / brightness* —
+> tedy to, že model má kapacitu na bright attack, ale loss ho k tomu netlačí.
+> Neřeší fyzikální inharmonicitu horních partials. Pokud se po tomto kroku attack zlepší,
+> ale stále chybí „strunová kovovost", není to selhání branch — je to signál pro dev-inharmonicity.
 
 ---
 
