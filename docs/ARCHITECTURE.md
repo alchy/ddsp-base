@@ -35,8 +35,13 @@ Výstup je plně stereo — každý kanál má nezávislé harmonické amplitudy
 Hlasitostní obálka se aplikuje **post-synthesis** jako lineární multiplikátor:
 
 ```
+# Piano inharmonicita — frekvence k-tého parciálu
+# inh: (B,) — learned B koeficient, MIDI-dependent rozsah
+stretch_k = sqrt( 1 + inh * k^2 )              # k = 1 .. N_HARM
+f_k(t)    = k * F0(t) * stretch_k              # f_k > k*F0 pro k > 1
+
 # Fázová akumulace (správná pro časově proměnné F0)
-phi_k(t) = cumsum( 2*pi * k * F0(t) / SR )    # k = 1 .. N_HARM
+phi_k(t) = cumsum( 2*pi * f_k(t) / SR )
 
 # Harmonická distribuce: softmax → součet přes k = 1
 d_k_L(t) = softmax( head_harm_L(feat) )
@@ -59,6 +64,8 @@ R(t) = timbre_R(t) * lo_linear(t)
 
 k = 1 .. N_HARM (32 harmonických oscilátorů)
 mag_spectrum: N_NOISE (129) spektrálních koeficientů
+inh = sigmoid(head_B(feat)).mean(T) * B_MAX(midi) * inh_scale
+B_MAX(midi) = 0.0008 * exp(-(midi-21)/88 * ln10)   # A0: 8e-4, C8: 8e-5
 ```
 
 **Klíčový princip**: síť se učí **pouze timbre** (overtone balance, barvu zvuku) z F0 a velocity.
@@ -179,19 +186,25 @@ Jednovrstvá MLP po GRU rozšíří reprezentaci před výstupními hlavami:
 
 ### Výstupní hlavy
 
-Čtyři lineární vrstvy z `mlp_dim` (bez `head_amp` — loudness je post-synthesis):
+Šest lineárních vrstev z `mlp_dim`:
 
 | Hlava | Aktivace | Výstup | Popis |
 |-------|----------|--------|-------|
-| `head_harm_L` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — levý kanál |
-| `head_harm_R` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — pravý kanál |
+| `head_harm_L` | softmax | (B, T, 32) | Normalizovaná harmonická distribuce — levý kanál |
+| `head_harm_R` | softmax | (B, T, 32) | Normalizovaná harmonická distribuce — pravý kanál |
+| `head_amp_L` | softplus | (B, T, 1) | Globální amplituda harmonické složky — levý kanál |
+| `head_amp_R` | softplus | (B, T, 1) | Globální amplituda harmonické složky — pravý kanál |
 | `head_noise_L` | sigmoid | (B, T, 129) | Spektrum šumu — levý kanál |
 | `head_noise_R` | sigmoid | (B, T, 129) | Spektrum šumu — pravý kanál |
+| `head_B` | sigmoid→pool | (B, 1) | Inharmonicity koeficient B (pooled přes T) |
 
-`head_harm_L` a `head_harm_R` jsou zcela nezávislé — model se naučí jiný overtone
-profil pro každý kanál podle toho, co data obsahují (stereo rozložení, rozdíly mikrofonů).
+`head_harm_L/R` produkují **softmax** distribuci (součet = 1), vynásobenou `softplus` amplitudou z `head_amp_L/R`.
+Tato canonical DDSP dekompozice odděluje timbre od hlasitosti a vede k lepší podmíněnosti trénování.
+`head_B` je poolován přes T (`.mean(dim=1)`) — B je konstantní pro celou notu, aby nevznikly
+frekvenční skoky mezi framy.
 Bias šumových hlav je inicializován na -3.0 (ticho na začátku trénování).
-`head_amp` byl odstraněn — hlasitost se aplikuje zvenčí (viz decoupled architektura).
+Bias `head_B` je inicializován na -5.0 (`sigmoid ≈ 0.007` → B ≈ 0 na startu, model se naučí B z dat).
+Hlasitost se aplikuje post-synthesis (viz decoupled architektura).
 
 ### Syntetizátory
 
@@ -299,8 +312,11 @@ Trenovaci batch (B, T=50)
         |  GRU     -> (B, T, gru_hidden)
         |  post_mlp -> (B, T, mlp_dim)
         |
-        |  head_harm_L  -> sigmoid -> (B, T, 32)  --.--> HarmonicSynth (/N norm) -> timbre_L (B, 1, T*HOP)
-        |  head_harm_R  -> sigmoid -> (B, T, 32)  --'--> HarmonicSynth (/N norm) -> timbre_R (B, 1, T*HOP)
+        |  head_harm_L  -> softmax -> (B, T, 32)  --.
+        |  head_amp_L   -> softplus-> (B, T, 1)  --+--> HarmonicSynth(inh) -> timbre_L (B, 1, T*HOP)
+        |  head_harm_R  -> softmax -> (B, T, 32)  --.
+        |  head_amp_R   -> softplus-> (B, T, 1)  --+--> HarmonicSynth(inh) -> timbre_R (B, 1, T*HOP)
+        |  head_B       -> sigmoid -> pool(T) -> (B,) * B_MAX(midi) * inh_scale = inh (B,)
         |  head_noise_L -> sigmoid -> (B, T, 129) -----> NoiseSynth_L  -> (B, 1, T*HOP)
         |  head_noise_R -> sigmoid -> (B, T, 129) -----> NoiseSynth_R  -> (B, 1, T*HOP)
         |
@@ -326,7 +342,7 @@ C:\SoundBanks\IthacaPlayer\<nastroj>\   (vygenerovane WAV pro IthacaPlayer)
 
 | Preset | gru_hidden | gru_layers | mlp_dim | Parametry | Doporucene pouziti |
 |--------|-----------|------------|---------|-----------|-------------------|
-| `small` | 64 | 1 | 128 | ~115 K | Rychle CPU trenovani, baseline |
+| `small` | 64 | 1 | 128 | ~113 K | Rychle CPU trenovani, baseline |
 | `medium` | 128 | 2 | 256 | ~452 K | Dobry kompromis, doporuceny default |
 | `large` | 256 | 3 | 512 | ~1.99 M | Nejlepsi kvalita, pomale na CPU |
 

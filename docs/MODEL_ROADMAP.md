@@ -24,6 +24,46 @@ harm_amps = harm_dist * harm_amp
 
 ---
 
+### [dev-inharmonicity] Piano inharmonicita strun
+
+**Problém**: model předpokládal `f_k = k·f0`. Reálné piano má vyšší parciály výše:
+```
+f_k = k · f0 · √(1 + B · k²)
+```
+Bez inharmonicity parciály „splývají" — basy znějí jako zvon místo jako klavír.
+
+**Implementace**: learned scalar B per nota, poolovaný přes T (konstantní B pro celou notu):
+
+```python
+# DDSPVocoder.__init__
+self.head_B = nn.Linear(mlp_dim, 1)
+nn.init.constant_(self.head_B.bias, -5.0)   # sigmoid ≈ 0.007 → B ≈ 0 na startu
+
+# DDSPVocoder.forward
+f0_mean  = f0_hz.clamp(min=F0_MIN).mean(dim=1)
+midi_est = 69.0 + 12.0 * torch.log2(f0_mean / 440.0)
+b_max    = 0.0008 * torch.exp(-(midi_est - 21.0) / 88.0 * math.log(10.0))
+inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) * b_max * inh_scale
+
+# HarmonicSynth.forward — inh: (B,)
+stretch   = torch.sqrt(1.0 + inh.unsqueeze(1) * k**2)   # (B, N)
+inst_freq = f0_up.unsqueeze(1) * (k * stretch).unsqueeze(2)
+```
+
+**MIDI-dependent B_MAX**: `B_0 · exp(-(midi-21)/88·ln10)` — A0: B_MAX ≈ 0.0008, C8: B_MAX ≈ 0.00008.
+Basy mají řádově vyšší inharmonicitu než výšky.
+
+**inh_scale**: parametr inference (0–2), výchozí 1.0.
+- 0.0 = čistě harmonické (diagnostický mód, bez inharmonicity)
+- 1.0 = naučená hodnota B (fyzikálně věrné)
+- 2.0 = zesílená inharmonicita
+
+CLI: `--inharmonicity-scale`, GUI: slider „Inharmonicity scale" (0.0–2.0).
+
+**+129 parametrů** (head_B: `mlp_dim → 1`).
+
+---
+
 ## Roadmap
 
 ### 1. [dev-frame-rate] Adaptivní frame rate řízený obálkou  ← nejvyšší priorita
@@ -71,7 +111,7 @@ Relativní rozestupy 4:1 odpovídají fyzikální realitě.
 | DDSPVocoder | přidat `time_enc` do `feat_dim` |
 | HarmonicSynth | beze změny (pracuje v samples) |
 
-**Kdy implementovat**: po dokončení dev-softmax testu (50 epoch). Ideálně na M5
+**Kdy implementovat**: dev-softmax test dokončen (50 epoch, val loss 1.1205). Ideálně na M5
 (4× hustší sekvence = 4× více výpočtu v attack části).
 
 ---
@@ -101,40 +141,7 @@ Pokud zlepšení bude marginální → přeskočit na dev-frame-rate bez další
 
 ---
 
-### 3. [dev-inharmonicity] Piano inharmonicita strun
-
-**Problém**: model předpokládá `f_k = k·f0`. Reálné piano má:
-```
-f_k = k · f0 · √(1 + B · k²)
-```
-Vyšší parciály jsou výše → chybí strunový charakter, beating, "živost" sustainu.
-Bez inharmonicity parciály "splývají" v MRSTFT bez ohledu na váhování lossu —
-inharmonicita může pomoci bright attacku víc než dev-attack-loss.
-
-**Implementace**: learned scalar B per nota (pooled přes T)
-
-```python
-self.head_B = nn.Linear(mlp_dim, 1)
-nn.init.constant_(self.head_B.bias, -5.0)   # start: B ≈ 0
-
-B_raw   = torch.sigmoid(self.head_B(feat)).mean(dim=1) * B_MAX   # pool → (B,1)
-stretch = torch.sqrt(1 + B_raw.unsqueeze(1) * k**2)
-inst_freq = f0_up.unsqueeze(1) * k * stretch.unsqueeze(2)
-```
-
-**B_MAX**: nepoužívat jeden globální bound — basy mají výrazně vyšší B než výšky.
-Lepší MIDI-dependent prior:
-```python
-B_MAX(midi) = B_0 · exp(-(midi - 21) / 88 · ln(10))
-# B_0 ≈ 0.0008 (A0), klesá na ~0.00008 (C8)
-```
-
-**Doporučený postup**: nejdřív fixed `B(midi)` jako baseline (žádné nové parametry),
-pak learned scalar. Pokud fixed dá 80 % benefitu — zvážit zda learned přidává hodnotu.
-
----
-
-### 4. [dev-noise-amp] Globální amplituda šumové složky
+### 3. [dev-noise-amp] Globální amplituda šumové složky
 
 **Problém**: po zavedení `head_amp_L/R` pro harmonické vznikla asymetrie —
 noise nemá globální scalar, model musí ladit všech 129 binů najednou.
