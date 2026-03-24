@@ -7,7 +7,8 @@ Vystup:
 
 Pouziti:
   python generate-midi.py
-  python generate-midi.py --hold 12 --gap 13
+  python generate-midi.py --hold 20 --gap 5 --step 1
+  python generate-midi.py --hold 20 --gap 5 --step 1 --split-octaves
   python generate-midi.py --hold 8 --gap 10 --step 6 --out my_session.mid
 """
 
@@ -97,10 +98,12 @@ def main():
                         help=f'Nejnizsi MIDI nota (default: {MIDI_MIN} = A0)')
     parser.add_argument('--midi-max', type=int, default=MIDI_MAX, dest='midi_max',
                         help=f'Nejvyssi MIDI nota (default: {MIDI_MAX} = C8)')
-    parser.add_argument('--out',     default='piano_sample_session.mid',
+    parser.add_argument('--out',          default='piano_sample_session.mid',
                         help='Vystupni MIDI soubor (default: piano_sample_session.mid)')
-    parser.add_argument('--map',     default='timing_map.json',
+    parser.add_argument('--map',          default='timing_map.json',
                         help='Vystupni timing map JSON (default: timing_map.json)')
+    parser.add_argument('--split-octaves', action='store_true', dest='split_octaves',
+                        help='Rozdel vystup na vice souboru po oktavach (C-based hranice)')
     args = parser.parse_args()
 
     sampled_notes = list(range(args.midi_min, args.midi_max + 1, args.step))
@@ -112,39 +115,85 @@ def main():
     print(f'Velocity:  {len(VELOCITY_MAP)} layers  (vel0-vel{len(VELOCITY_MAP)-1})')
     print(f'Slot:      {args.hold}s hold + {args.gap}s gap = {slot_sec}s per note')
     print(f'Total:     {total_sec // 60} min {total_sec % 60} sec')
+    if args.split_octaves:
+        oct_notes = 12 // args.step if args.step <= 12 else 1
+        print(f'Split:     ~{oct_notes * len(VELOCITY_MAP) * slot_sec // 60} min/oktava')
     print()
 
+    if args.split_octaves:
+        _write_split_octaves(sampled_notes, slot_sec, args)
+    else:
+        _write_single(sampled_notes, slot_sec, args)
+
+
+def _build_events_map(sampled_notes, slot_sec, hold_sec):
+    """Vraci (midi_events, timing_map) s casem od 0."""
     midi_events = []
     timing_map  = []
-
     beat = 0
     for midi_note in sampled_notes:
         for vel_idx, midi_vel in VELOCITY_MAP.items():
-            name = f'm{midi_note:03d}-vel{vel_idx}-f48'
             timing_map.append({
-                'name':      name,
+                'name':      f'm{midi_note:03d}-vel{vel_idx}-f48',
                 'midi_note': midi_note,
                 'vel_idx':   vel_idx,
                 'start_sec': beat,
                 'end_sec':   beat + slot_sec,
             })
-            midi_events.append((beat, midi_note, midi_vel, args.hold))
+            midi_events.append((beat, midi_note, midi_vel, hold_sec))
             beat += slot_sec
+    return midi_events, timing_map
 
-    with open(args.out, 'wb') as f:
+
+def _save(midi_path, map_path, midi_events, timing_map, args):
+    with open(midi_path, 'wb') as f:
         f.write(build_midi(midi_events))
-    print(f'Saved: {args.out}')
+    with open(map_path, 'w', encoding='utf-8') as f:
+        json.dump({'sr': SR, 'hold_sec': args.hold, 'gap_sec': args.gap,
+                   'samples': timing_map}, f, indent=2)
+    n   = len(set(e['midi_note'] for e in timing_map))
+    sec = timing_map[-1]['end_sec']
+    print(f'  {midi_path}  ({n} not, {sec // 60} min {sec % 60} sec)')
 
-    with open(args.map, 'w', encoding='utf-8') as f:
-        json.dump({
-            'sr':       SR,
-            'hold_sec': args.hold,
-            'gap_sec':  args.gap,
-            'samples':  timing_map,
-        }, f, indent=2)
-    print(f'Saved: {args.map}')
+
+def _write_single(sampled_notes, slot_sec, args):
+    events, tmap = _build_events_map(sampled_notes, slot_sec, args.hold)
+    _save(args.out, args.map, events, tmap, args)
     print()
     print('Next: open', args.out, 'in Studio One')
+    print('  -> assign instrument plugin, export/record as WAV 48kHz stereo')
+
+
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+def _note_name(midi):
+    return f'{NOTE_NAMES[midi % 12]}{midi // 12 - 1}'
+
+
+def _write_split_octaves(sampled_notes, slot_sec, args):
+    # Rozdel noty po oktavach: C_n = MIDI 12*(n+1) .. 12*(n+2)-1
+    # Hranice: first_C <= note < next_C
+    from collections import defaultdict
+    octave_groups = defaultdict(list)
+    for note in sampled_notes:
+        oct_n = note // 12   # C-based cislo oktavy (C-1=0, C0=1, C1=2, ...)
+        octave_groups[oct_n].append(note)
+
+    stem = args.out.replace('.mid', '')
+    map_stem = args.map.replace('.json', '')
+
+    print('Generuji soubory:')
+    for oct_n in sorted(octave_groups):
+        notes = octave_groups[oct_n]
+        lo, hi = notes[0], notes[-1]
+        tag = f'{_note_name(lo)}-{_note_name(hi)}'
+        midi_path = f'{stem}_{tag}.mid'
+        map_path  = f'{map_stem}_{tag}.json'
+        events, tmap = _build_events_map(notes, slot_sec, args.hold)
+        _save(midi_path, map_path, events, tmap, args)
+
+    print()
+    print('Next: nahraj kazdy MIDI soubor zvlast v Studio One')
     print('  -> assign instrument plugin, export/record as WAV 48kHz stereo')
 
 if __name__ == '__main__':
