@@ -50,16 +50,16 @@ mXXX-velX-f48.wav  →  python ddsp.py extract --instrument <slozka>
 
 ---
 
-## sfz_convert.py
+## sfz2ithacabank.py
 
 Konvertuje SFZ instrument bank do formátu `mXXX-velX-fXX.wav` pro DDSP pipeline.
 
 ### Použití
 
 ```bash
-python sfz_convert.py Salamander.sfz C:/SoundBanks/ddsp/salamander
-python sfz_convert.py Salamander.sfz C:/SoundBanks/ddsp/salamander --vel-layers 8 --sr 48000
-python sfz_convert.py Salamander.sfz C:/SoundBanks/ddsp/salamander --dry-run
+python sfz2ithacabank.py Salamander.sfz C:/SoundBanks/ddsp/salamander
+python sfz2ithacabank.py Salamander.sfz C:/SoundBanks/ddsp/salamander --vel-layers 8 --sr 48000
+python sfz2ithacabank.py Salamander.sfz C:/SoundBanks/ddsp/salamander --dry-run
 ```
 
 ### Parametry
@@ -90,7 +90,7 @@ Resample: automaticky přes `scipy` nebo `librosa` (je-li nainstalováno).
 
 ---
 
-## bank_to_sfz.py
+## ithacabank2sfz.py
 
 Exportuje DDSP sample banku (`mXXX-velX-fXX.wav`) jako SFZ soubor
 pro přehrávání v libovolném SFZ přehrávači (sfizz, ARIA, Plogue Sforzando, …).
@@ -98,10 +98,10 @@ pro přehrávání v libovolném SFZ přehrávači (sfizz, ARIA, Plogue Sforzand
 ### Použití
 
 ```bash
-python bank_to_sfz.py C:/SoundBanks/ddsp/salamander
-python bank_to_sfz.py C:/SoundBanks/ddsp/salamander --out salamander.sfz
-python bank_to_sfz.py C:/SoundBanks/ddsp/salamander --sr 48
-python bank_to_sfz.py C:/SoundBanks/ddsp/salamander --absolute-paths
+python ithacabank2sfz.py C:/SoundBanks/ddsp/salamander
+python ithacabank2sfz.py C:/SoundBanks/ddsp/salamander --out salamander.sfz
+python ithacabank2sfz.py C:/SoundBanks/ddsp/salamander --sr 48
+python ithacabank2sfz.py C:/SoundBanks/ddsp/salamander --absolute-paths
 ```
 
 ### Parametry
