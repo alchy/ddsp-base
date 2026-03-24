@@ -2,10 +2,14 @@
 model_ddsp.py - DDSP Neural Vocoder
 
 Signal model:
-    L(t) = Σ_k  A_k_L(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, left]
+    φ_k(t) = cumsum(2π·k·F0(t)/SR)                  [phase accumulation, correct for time-varying F0]
+    L(t) = A_L(t) · Σ_k  d_k_L(t) · sin(φ_k(t))   [harmonic oscillators, left]
          + noise_STFT_shaped_L(t)                     [filtered noise, left]
-    R(t) = Σ_k  A_k_R(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, right]
+    R(t) = A_R(t) · Σ_k  d_k_R(t) · sin(φ_k(t))   [harmonic oscillators, right]
          + noise_STFT_shaped_R(t)                     [filtered noise, right]
+
+where d_k (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
+      A   (global amplitude)       = softplus(head_amp)
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -108,9 +112,9 @@ class HarmonicSynth(nn.Module):
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
-        t         = torch.arange(n_samples, dtype=torch.float32, device=device)
-        mean_freq = inst_freq.mean(dim=2, keepdim=True)
-        phase     = 2.0 * math.pi * mean_freq * t.view(1, 1, -1) / SR
+        # Phase accumulation: cumsum over instantaneous frequency (correct for time-varying F0)
+        # inst_freq shape: (B, N, n_samples)  units: Hz
+        phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
         return signal / N   # normalize: mean harmonic → unit amplitude
@@ -182,8 +186,12 @@ class DDSPVocoder(nn.Module):
         )
 
         # Independent harmonic amplitude profiles per channel
+        # harm_dist: softmax → normalized harmonic distribution (sums to 1)
+        # harm_amp:  softplus → global amplitude scalar per frame
         self.head_harm_L  = nn.Linear(mlp_dim, N_HARM)
         self.head_harm_R  = nn.Linear(mlp_dim, N_HARM)
+        self.head_amp_L   = nn.Linear(mlp_dim, 1)
+        self.head_amp_R   = nn.Linear(mlp_dim, 1)
         self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
         self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
 
@@ -214,8 +222,13 @@ class DDSPVocoder(nn.Module):
         feat, _ = self.gru(feat)
         feat    = self.post_mlp(feat)
 
-        harm_amps_L = torch.sigmoid(self.head_harm_L(feat))
-        harm_amps_R = torch.sigmoid(self.head_harm_R(feat))
+        # Canonical DDSP: softmax distribution × softplus global amplitude
+        harm_dist_L = torch.softmax(self.head_harm_L(feat), dim=-1)
+        harm_dist_R = torch.softmax(self.head_harm_R(feat), dim=-1)
+        harm_amp_L  = F.softplus(self.head_amp_L(feat))   # (B, T, 1)
+        harm_amp_R  = F.softplus(self.head_amp_R(feat))
+        harm_amps_L = harm_dist_L * harm_amp_L
+        harm_amps_R = harm_dist_R * harm_amp_R
         noise_L     = torch.sigmoid(self.head_noise_L(feat))
         noise_R     = torch.sigmoid(self.head_noise_R(feat))
 

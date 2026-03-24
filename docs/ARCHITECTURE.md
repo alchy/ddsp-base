@@ -35,10 +35,21 @@ Výstup je plně stereo — každý kanál má nezávislé harmonické amplitudy
 Hlasitostní obálka se aplikuje **post-synthesis** jako lineární multiplikátor:
 
 ```
-timbre_L(t) = (1/N) * SUM_k [ a_k_L(t) * sin(2*pi * k * F0(t) * t / SR) ]
+# Fázová akumulace (správná pro časově proměnné F0)
+phi_k(t) = cumsum( 2*pi * k * F0(t) / SR )    # k = 1 .. N_HARM
+
+# Harmonická distribuce: softmax → součet přes k = 1
+d_k_L(t) = softmax( head_harm_L(feat) )
+d_k_R(t) = softmax( head_harm_R(feat) )
+
+# Globální amplituda: softplus → vždy > 0
+A_L(t) = softplus( head_amp_L(feat) )
+A_R(t) = softplus( head_amp_R(feat) )
+
+timbre_L(t) = (1/N) * A_L(t) * SUM_k [ d_k_L(t) * sin(phi_k(t)) ]
             + ISTFT( STFT(white_noise_L) * mag_spectrum_L(t) )
 
-timbre_R(t) = (1/N) * SUM_k [ a_k_R(t) * sin(2*pi * k * F0(t) * t / SR) ]
+timbre_R(t) = (1/N) * A_R(t) * SUM_k [ d_k_R(t) * sin(phi_k(t)) ]
             + ISTFT( STFT(white_noise_R) * mag_spectrum_R(t) )
 
 lo_linear(t) = 10 ^ (loudness_dB(t) / 20)     # dB → lineární amplituda
@@ -57,13 +68,19 @@ Výsledkem je čistá separace:
 - **Co se naučí síť**: jak nástroj *zní* (poměr harmonických, šum, stereo panning)
 - **Co přichází zvenčí**: jak *hlasitý* je (obálka z EnvelopeNet nebo z NPZ)
 
-Amplitudy `a_k_L(t)`, `a_k_R(t)` produkují dvě nezávislé hlavy (`head_harm_L`, `head_harm_R`).
+**Harmonická distribuce (softmax)**: `d_k` jsou normalizované váhy — jejich součet přes všechny harmonické
+je vždy 1. Globální amplituda `A(t)` (softplus) škáluje celkovou hlasitost harmonické složky nezávisle
+na timbrovém rozložení. Tato dekompozice (canonical DDSP) vede k lepší podmíněnosti trénování
+oproti dřívějšímu přístupu se `sigmoid` (každá harmonická nezávisle, bez normalizace).
+
+**Fázová akumulace (cumsum)**: fáze oscilátorů se počítá kumulativním součtem okamžité frekvence,
+nikoli jako `freq × t`. To je správné pro časově proměnné F0 a eliminuje fázové skoky při
+interpolaci frekvencí.
+
+Amplitudy `harm_amps_L/R` produkují dvě nezávislé hlavy (`head_harm_L`, `head_harm_R`).
 Model se tak z dat naučí, jak se liší overtone balance mezi kanály — například
 prostorové rozložení strun klavíru (bas vlevo, výšky vpravo) nebo rozdílný přenos
 frekvencí u různých mikrofonních pozic.
-
-`HarmonicSynth` normalizuje výstup dělením `/N` (počet harmonických) — průměrná harmonická
-produkuje jednotkovou amplitudu bez závislosti na počtu aktivních harmonických.
 
 ---
 
