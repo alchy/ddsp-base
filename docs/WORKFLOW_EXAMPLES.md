@@ -129,7 +129,7 @@ python ddsp.py status --instrument C:\SoundBanks\ddsp\vintage-vibe
 - 30 not × 8 velocity vrstev = 240 WAV souborů
 - MIDI 21 (A0) – 108 (C8), vzorkováno každé 3 půltóny
 - Filename: `mXXX-velY-f48.wav` → F0 se odvozuje přímo z názvu (known-F0 mod)
-- Původ: Salamander Grand Piano V3 (SFZ banka) → převod přes `sfz_convert.py`
+- Původ: Salamander Grand Piano V3 (SFZ banka) → převod přes `sfz2ithacabank.py`
 
 ### Krok 1: Extrakce příznaků
 
@@ -192,7 +192,7 @@ python ddsp.py generate \
 ### Krok 4: Export do SFZ (volitelné)
 
 ```bash
-python bank_to_sfz.py C:\SoundBanks\IthacaPlayer\salamander \
+python tools/ithacabank2sfz.py C:\SoundBanks\IthacaPlayer\salamander \
   --out C:\SoundBanks\SFZ\salamander-ddsp.sfz \
   --sr 48 \
   --name "Salamander DDSP"
@@ -259,7 +259,7 @@ generate --instrument <dir>
 ```
 C:\SoundBanks\SFZ\SalamanderGrandPianoV3\   (originální SFZ, READ-ONLY)
         |
-        v  python sfz_convert.py *.sfz C:\SoundBanks\ddsp\salamander --vel-layers 8
+        v  python tools/sfz2ithacabank.py *.sfz C:\SoundBanks\ddsp\salamander --vel-layers 8
         |
 C:\SoundBanks\ddsp\<nastroj>\               (zdrojové WAV mXXX-velY-f48.wav, READ-ONLY)
         |
@@ -278,7 +278,7 @@ C:\SoundBanks\ddsp\<nastroj>-ddsp\checkpoints\best.pt
         |
 C:\SoundBanks\IthacaPlayer\<nastroj>\mXXX-velY-f48.wav   (výstup pro IthacaPlayer)
         |
-        v  (volitelně) python bank_to_sfz.py <dir> --out <nastroj>.sfz
+        v  (volitelně) python tools/ithacabank2sfz.py <dir> --out <nastroj>.sfz
         |
 C:\SoundBanks\SFZ\<nastroj>-ddsp.sfz        (pro Kontakt / sforzando / jiné SFZ playery)
 ```

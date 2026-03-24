@@ -29,25 +29,58 @@ jako čistě neuronové metody.
 
 ---
 
-## Signálový model
+## Signálový model — Decoupled Timbre Architektura
 
-Výstup je plně stereo — každý kanál má nezávislé harmonické amplitudy i šumový profil:
+Výstup je plně stereo — každý kanál má nezávislé harmonické amplitudy i šumový profil.
+Hlasitostní obálka se aplikuje **post-synthesis** jako lineární multiplikátor:
 
 ```
-L(t) = overall_amp(t) * SUM_k [ a_k_L(t) * sin(2*pi * k * F0(t) * t / SR) ]
-     + ISTFT( STFT(white_noise_L) * mag_spectrum_L(t) )
+# Fázová akumulace (správná pro časově proměnné F0)
+phi_k(t) = cumsum( 2*pi * k * F0(t) / SR )    # k = 1 .. N_HARM
 
-R(t) = overall_amp(t) * SUM_k [ a_k_R(t) * sin(2*pi * k * F0(t) * t / SR) ]
-     + ISTFT( STFT(white_noise_R) * mag_spectrum_R(t) )
+# Harmonická distribuce: softmax → součet přes k = 1
+d_k_L(t) = softmax( head_harm_L(feat) )
+d_k_R(t) = softmax( head_harm_R(feat) )
+
+# Globální amplituda: softplus → vždy > 0
+A_L(t) = softplus( head_amp_L(feat) )
+A_R(t) = softplus( head_amp_R(feat) )
+
+timbre_L(t) = (1/N) * A_L(t) * SUM_k [ d_k_L(t) * sin(phi_k(t)) ]
+            + ISTFT( STFT(white_noise_L) * mag_spectrum_L(t) )
+
+timbre_R(t) = (1/N) * A_R(t) * SUM_k [ d_k_R(t) * sin(phi_k(t)) ]
+            + ISTFT( STFT(white_noise_R) * mag_spectrum_R(t) )
+
+lo_linear(t) = 10 ^ (loudness_dB(t) / 20)     # dB → lineární amplituda
+
+L(t) = timbre_L(t) * lo_linear(t)
+R(t) = timbre_R(t) * lo_linear(t)
 
 k = 1 .. N_HARM (32 harmonických oscilátorů)
 mag_spectrum: N_NOISE (129) spektrálních koeficientů
 ```
 
-Amplitudy `a_k_L(t)`, `a_k_R(t)` produkují dvě nezávislé hlavy (`head_harm_L`, `head_harm_R`).
+**Klíčový princip**: síť se učí **pouze timbre** (overtone balance, barvu zvuku) z F0 a velocity.
+Hlasitost se do sítě nepodává a neovlivňuje naučené harmonické profily.
+Výsledkem je čistá separace:
+
+- **Co se naučí síť**: jak nástroj *zní* (poměr harmonických, šum, stereo panning)
+- **Co přichází zvenčí**: jak *hlasitý* je (obálka z EnvelopeNet nebo z NPZ)
+
+**Harmonická distribuce (softmax)**: `d_k` jsou normalizované váhy — jejich součet přes všechny harmonické
+je vždy 1. Globální amplituda `A(t)` (softplus) škáluje celkovou hlasitost harmonické složky nezávisle
+na timbrovém rozložení. Tato dekompozice (canonical DDSP) vede k lepší podmíněnosti trénování
+oproti dřívějšímu přístupu se `sigmoid` (každá harmonická nezávisle, bez normalizace).
+
+**Fázová akumulace (cumsum)**: fáze oscilátorů se počítá kumulativním součtem okamžité frekvence,
+nikoli jako `freq × t`. To je správné pro časově proměnné F0 a eliminuje fázové skoky při
+interpolaci frekvencí.
+
+Amplitudy `harm_amps_L/R` produkují dvě nezávislé hlavy (`head_harm_L`, `head_harm_R`).
 Model se tak z dat naučí, jak se liší overtone balance mezi kanály — například
 prostorové rozložení strun klavíru (bas vlevo, výšky vpravo) nebo rozdílný přenos
-frekvencí u různých mikrofonních pozic. `overall_amp` je sdílená obálka pro oba kanály.
+frekvencí u různých mikrofonních pozic.
 
 ---
 
@@ -103,24 +136,27 @@ Model `DDSPVocoder` zpracovává sekvenci rámců (B, T) a produkuje stereo audi
 
 ### Enkodéry příznaků (bez parametrů)
 
-Tři sinusoidální enkodéry převádí skalární příznaky na vektory:
+Dva sinusoidální enkodéry převádí skalární příznaky na vektory pro timbre síť.
+Loudness se do sítě **nepodává** — viz decoupled architektura výše.
 
 | Enkodér | Vstup | Výstup | Dim |
 |---------|-------|--------|-----|
 | `encode_f0` | F0 v Hz (log-normalizace) | (B, T, F0_BINS) | 64 |
-| `encode_loudness` | loudness dB (lineár. norm.) | (B, T, LO_DIM) | 16 |
 | `encode_velocity` | velocity 0–7 (statická) | (B, VEL_DIM) | 8 |
 
 Velocity je statická pro celou notu a je broadcastována na (B, T, VEL_DIM).
-Výsledný vstupní vektor na rámec: 64 + 16 + 8 = **88 dimenzí**.
+Výsledný vstupní vektor na rámec: 64 + 8 = **72 dimenzí**.
+
+`encode_loudness` je stále definován v `model_ddsp.py` pro případné pozdější rozšíření,
+ale není součástí trénovací cesty.
 
 ### pre_mlp
 
 Dvouvrstvá MLP předpřipravuje příznaky před GRU:
 
 ```
-feat (B, T, 88)
-  -> Linear(88, mlp_dim) -> ReLU
+feat (B, T, 72)
+  -> Linear(72, mlp_dim) -> ReLU
   -> Linear(mlp_dim, mlp_dim) -> ReLU
   -> (B, T, mlp_dim)
 ```
@@ -143,19 +179,19 @@ Jednovrstvá MLP po GRU rozšíří reprezentaci před výstupními hlavami:
 
 ### Výstupní hlavy
 
-Pět lineárních vrstev z `mlp_dim`:
+Čtyři lineární vrstvy z `mlp_dim` (bez `head_amp` — loudness je post-synthesis):
 
 | Hlava | Aktivace | Výstup | Popis |
 |-------|----------|--------|-------|
 | `head_harm_L` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — levý kanál |
 | `head_harm_R` | sigmoid | (B, T, 32) | Per-harmonické amplitudy a_k — pravý kanál |
-| `head_amp` | softplus | (B, T, 1) | Celková obálka overall_amp (sdílená) |
 | `head_noise_L` | sigmoid | (B, T, 129) | Spektrum šumu — levý kanál |
 | `head_noise_R` | sigmoid | (B, T, 129) | Spektrum šumu — pravý kanál |
 
 `head_harm_L` a `head_harm_R` jsou zcela nezávislé — model se naučí jiný overtone
 profil pro každý kanál podle toho, co data obsahují (stereo rozložení, rozdíly mikrofonů).
 Bias šumových hlav je inicializován na -3.0 (ticho na začátku trénování).
+`head_amp` byl odstraněn — hlasitost se aplikuje zvenčí (viz decoupled architektura).
 
 ### Syntetizátory
 
@@ -254,26 +290,26 @@ NPZ cache (extracts/*.npz)
 Trenovaci batch (B, T=50)
   f0 [Hz], loudness_L/R [dB], velocity [0-7], audio (2, T*HOP)
         |
-        v  [DDSPVocoder.forward]
+        v  [DDSPVocoder.forward]  — Decoupled Timbre Architektura
         |
         |  encode_f0 -> (B, T, 64)
-        |  encode_loudness -> (B, T, 16)     ]
-        |  encode_velocity -> (B, T, 8)      ] -> cat -> (B, T, 88)
+        |  encode_velocity -> (B, T, 8)      ] -> cat -> (B, T, 72)   [loudness NENÍ vstupem]
         |
         |  pre_mlp -> (B, T, mlp_dim)
         |  GRU     -> (B, T, gru_hidden)
         |  post_mlp -> (B, T, mlp_dim)
         |
-        |  head_harm_L  -> sigmoid -> (B, T, 32)  --.--> HarmonicSynth -> harmonic_L (B, 1, T*HOP)
-        |  head_harm_R  -> sigmoid -> (B, T, 32)  --'--> HarmonicSynth -> harmonic_R (B, 1, T*HOP)
-        |  head_amp     -> softplus -> (B, T, 1)  -----> (sdilena obalka pro oba kanaly)
+        |  head_harm_L  -> sigmoid -> (B, T, 32)  --.--> HarmonicSynth (/N norm) -> timbre_L (B, 1, T*HOP)
+        |  head_harm_R  -> sigmoid -> (B, T, 32)  --'--> HarmonicSynth (/N norm) -> timbre_R (B, 1, T*HOP)
         |  head_noise_L -> sigmoid -> (B, T, 129) -----> NoiseSynth_L  -> (B, 1, T*HOP)
         |  head_noise_R -> sigmoid -> (B, T, 129) -----> NoiseSynth_R  -> (B, 1, T*HOP)
         |
+        |  loudness_db (B, T) -> 10^(dB/20) -> upsample -> lo_up (B, 1, T*HOP)
+        |
         v
 Stereo audio (B, 2, T*HOP)
-  L = harmonic_L + noise_L
-  R = harmonic_R + noise_R
+  L = (timbre_L + noise_L) * lo_up
+  R = (timbre_R + noise_R) * lo_up
         |
         v  [mrstft_loss + 0.2 * L1]
         |
@@ -306,3 +342,63 @@ takze inference po nacteni checkpointu nepotrebuje znovu specifikovat preset.
 - **Zmena syntetizatoru**: `HarmonicSynth` a `NoiseSynth` jsou samostatne `nn.Module`, lze nahradit
 - **Vicenasobna F0 (akordy)**: rozsir `head_harm` na (B, T, N_HARM * N_VOICES) a uprav `HarmonicSynth`
 - **Vlastni loss**: nahrad `mrstft_loss` v `cmd_learn` libovolnou diferencovatelnou funkci
+
+---
+
+## Coupled vs. Decoupled trénink EnvelopeNet + DDSP
+
+Existují dva přístupy k tréninku, které se liší ve vztahu mezi EnvelopeNet a DDSP modelem.
+
+### Decoupled (výchozí, větev `main`)
+
+```
+NPZ extracts ──► DDSP trénink   (loudness z NPZ, reálná dynamika)
+NPZ extracts ──► EnvelopeNet trénink  (samostatně, kdykoli)
+
+Inference (full-range):
+  EnvelopeNet.predict(midi, vel) → loudness → DDSPVocoder → audio
+```
+
+**Výhoda**: jednodušší, rychlejší, DDSP vidí přesnou reálnou dynamiku nahrávek.
+**Nevýhoda**: mismatch distribuce — DDSP byl trénován s originální loudness,
+ale při full-range generování dostane EnvelopeNet aproximaci (hladší, warped osa).
+Tento rozdíl je v praxi malý pro standardní mód (generate ze zdrojových WAV),
+ale může ovlivnit full-range mode.
+
+### Coupled (příznak `--coupled`)
+
+```
+NPZ extracts ──► EnvelopeNet trénink  (PRVNÍ)
+                     │
+                     ▼
+NPZ extracts ──► DDSP trénink  (--env-mix % batchů: loudness z EnvelopeNet,
+                                 zbytek: reálná NPZ loudness)
+
+Inference (full-range):
+  EnvelopeNet.predict(midi, vel) → loudness → DDSPVocoder → audio
+  ✓ stejná distribuce jako při tréninku
+```
+
+**Výhoda**: DDSP model vidí EnvelopeNet loudness i při tréninku → zarovnaná distribuce.
+**Výhoda**: `--env-mix 0.5` zachovává 50 % batchů s reálnou loudness → model je robustní pro standardní mód.
+**Nevýhoda**: pomalejší start (EnvelopeNet trénink ~minuty před DDSP), mírně složitější pipeline.
+
+### Volba přístupu
+
+| Situace | Doporučení |
+|---------|-----------|
+| Standardní generování (ze zdrojových WAV) | Decoupled — mismatch nevadí |
+| Full-range banka (chromatická, bez zdrojových WAV) | Coupled — lepší konzistence |
+| Rychlý experiment / prototyp | Decoupled |
+| Produkční banka pro IthacaPlayer | Coupled s `--env-mix 0.5` |
+
+### Použití
+
+```bash
+# Decoupled (default)
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300
+
+# Coupled
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300 \
+    --coupled --env-mix 0.5
+```

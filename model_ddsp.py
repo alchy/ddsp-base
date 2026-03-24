@@ -2,10 +2,14 @@
 model_ddsp.py - DDSP Neural Vocoder
 
 Signal model:
-    L(t) = Σ_k  A_k_L(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, left]
+    φ_k(t) = cumsum(2π·k·F0(t)/SR)                  [phase accumulation, correct for time-varying F0]
+    L(t) = A_L(t) · Σ_k  d_k_L(t) · sin(φ_k(t))   [harmonic oscillators, left]
          + noise_STFT_shaped_L(t)                     [filtered noise, left]
-    R(t) = Σ_k  A_k_R(t) · sin(2π·k·F0(t)·t/SR)   [harmonic oscillators, right]
+    R(t) = A_R(t) · Σ_k  d_k_R(t) · sin(φ_k(t))   [harmonic oscillators, right]
          + noise_STFT_shaped_R(t)                     [filtered noise, right]
+
+where d_k (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
+      A   (global amplitude)       = softplus(head_amp)
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -87,15 +91,19 @@ def encode_loudness(loudness_db: torch.Tensor, dim: int = LO_DIM) -> torch.Tenso
 class HarmonicSynth(nn.Module):
     """
     Additive synthesis: weighted sum of N_HARM sinusoids at k * F0(t).
+
+    Output is amplitude-normalized by 1/N_HARM so that the mean harmonic
+    produces unit amplitude regardless of how many harmonics are active.
+    Loudness is applied externally as a post-multiplier in DDSPVocoder.
+
     Output: (B, 1, n_samples)
     """
 
-    def forward(self, harm_amps, overall_amp, f0_hz, n_samples):
+    def forward(self, harm_amps, f0_hz, n_samples):
         B, T_frames, N = harm_amps.shape
         device = harm_amps.device
 
-        a  = F.interpolate(harm_amps.permute(0, 2, 1),   size=n_samples, mode='linear', align_corners=False)
-        oa = F.interpolate(overall_amp.permute(0, 2, 1), size=n_samples, mode='linear', align_corners=False)
+        a     = F.interpolate(harm_amps.permute(0, 2, 1), size=n_samples, mode='linear', align_corners=False)
         f0_up = F.interpolate(f0_hz.unsqueeze(1).float(), size=n_samples, mode='linear', align_corners=False).squeeze(1)
 
         k = torch.arange(1, N + 1, dtype=torch.float32, device=device)
@@ -104,12 +112,12 @@ class HarmonicSynth(nn.Module):
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
-        t         = torch.arange(n_samples, dtype=torch.float32, device=device)
-        mean_freq = inst_freq.mean(dim=2, keepdim=True)
-        phase     = 2.0 * math.pi * mean_freq * t.view(1, 1, -1) / SR
+        # Phase accumulation: cumsum over instantaneous frequency (correct for time-varying F0)
+        # inst_freq shape: (B, N, n_samples)  units: Hz
+        phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
-        return signal * oa
+        return signal / N   # normalize: mean harmonic → unit amplitude
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +170,9 @@ class DDSPVocoder(nn.Module):
     def __init__(self, gru_hidden=64, gru_layers=1, mlp_dim=128):
         super().__init__()
 
-        feat_dim = F0_BINS + LO_DIM + VEL_DIM   # 88
+        # Loudness removed from GRU input — applied post-synthesis as a
+        # linear multiplier so the network learns pure timbre independently.
+        feat_dim = F0_BINS + VEL_DIM   # 72
 
         self.pre_mlp = nn.Sequential(
             nn.Linear(feat_dim, mlp_dim), nn.ReLU(),
@@ -176,9 +186,12 @@ class DDSPVocoder(nn.Module):
         )
 
         # Independent harmonic amplitude profiles per channel
+        # harm_dist: softmax → normalized harmonic distribution (sums to 1)
+        # harm_amp:  softplus → global amplitude scalar per frame
         self.head_harm_L  = nn.Linear(mlp_dim, N_HARM)
         self.head_harm_R  = nn.Linear(mlp_dim, N_HARM)
-        self.head_amp     = nn.Linear(mlp_dim, 1)
+        self.head_amp_L   = nn.Linear(mlp_dim, 1)
+        self.head_amp_R   = nn.Linear(mlp_dim, 1)
         self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
         self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
 
@@ -187,38 +200,53 @@ class DDSPVocoder(nn.Module):
 
         nn.init.constant_(self.head_noise_L.bias, -3.0)
         nn.init.constant_(self.head_noise_R.bias, -3.0)
-        nn.init.zeros_(self.head_amp.bias)
 
     def forward(self, f0_hz, loudness_db, velocity=None, n_frames=None):
+        """
+        f0_hz       : (B, T)  in Hz, 0 = unvoiced
+        loudness_db : (B, T)  in dB (used as post-synthesis amplitude envelope)
+        velocity    : (B,)    MIDI velocity bucket 0-7
+        """
         B, T = f0_hz.shape
         if n_frames is None:
             n_frames = T
         if velocity is None:
             velocity = torch.full((B,), 5.0, dtype=torch.float32, device=f0_hz.device)
 
+        # Timbre network: F0 + velocity only (no loudness)
         f0_enc  = encode_f0(f0_hz, F0_BINS)
-        lo_enc  = encode_loudness(loudness_db, LO_DIM)
         vel_enc = encode_velocity(velocity, VEL_DIM).unsqueeze(1).expand(-1, T, -1)
-        feat    = torch.cat([f0_enc, lo_enc, vel_enc], dim=-1)
+        feat    = torch.cat([f0_enc, vel_enc], dim=-1)
 
         feat    = self.pre_mlp(feat)
         feat, _ = self.gru(feat)
         feat    = self.post_mlp(feat)
 
-        harm_amps_L = torch.sigmoid(self.head_harm_L(feat))
-        harm_amps_R = torch.sigmoid(self.head_harm_R(feat))
-        overall_amp = F.softplus(self.head_amp(feat))
+        # Canonical DDSP: softmax distribution × softplus global amplitude
+        harm_dist_L = torch.softmax(self.head_harm_L(feat), dim=-1)
+        harm_dist_R = torch.softmax(self.head_harm_R(feat), dim=-1)
+        harm_amp_L  = F.softplus(self.head_amp_L(feat))   # (B, T, 1)
+        harm_amp_R  = F.softplus(self.head_amp_R(feat))
+        harm_amps_L = harm_dist_L * harm_amp_L
+        harm_amps_R = harm_dist_R * harm_amp_R
         noise_L     = torch.sigmoid(self.head_noise_L(feat))
         noise_R     = torch.sigmoid(self.head_noise_R(feat))
 
-        n_samples    = n_frames * FRAME_HOP
-        harmonic_L   = self.harm_synth(harm_amps_L, overall_amp, f0_hz, n_samples)
-        harmonic_R   = self.harm_synth(harm_amps_R, overall_amp, f0_hz, n_samples)
-        noise_sig_L  = self.noise_synth(noise_L, n_samples)
-        noise_sig_R  = self.noise_synth(noise_R, n_samples)
+        n_samples   = n_frames * FRAME_HOP
+        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples)
+        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples)
+        noise_sig_L = self.noise_synth(noise_L, n_samples)
+        noise_sig_R = self.noise_synth(noise_R, n_samples)
 
-        L = harmonic_L + noise_sig_L
-        R = harmonic_R + noise_sig_R
+        # Loudness applied as a linear amplitude envelope (post-synthesis)
+        # Convert dB → linear, upsample from frame rate to sample rate
+        lo_lin = 10.0 ** (loudness_db / 20.0)                                    # (B, T)
+        lo_up  = F.interpolate(lo_lin.unsqueeze(1).float(),
+                               size=n_samples, mode='linear',
+                               align_corners=False)                               # (B, 1, n_samples)
+
+        L = (harmonic_L + noise_sig_L) * lo_up
+        R = (harmonic_R + noise_sig_R) * lo_up
         return torch.cat([L, R], dim=1)   # (B, 2, n_samples)
 
 

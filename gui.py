@@ -126,6 +126,11 @@ def build_ui():
                     placeholder=r'C:\SoundBanks\ddsp\vintage-vibe-ddsp',
                     info='Vyplnte pouze pokud se workspace lisi od vychozi cesty.',
                 )
+                device_dd = gr.Dropdown(
+                    ['auto', 'cpu', 'mps', 'cuda'], value='auto',
+                    label='Zarizeni (device)',
+                    info='auto = CUDA → MPS (Apple Silicon) → CPU. Vyberte mps pro Apple M-series.',
+                )
                 status_out = gr.Textbox(label='Stav nastroje', lines=10, interactive=False)
                 status_btn.click(fn=_read_status, inputs=[instrument_in, workspace_in], outputs=status_out)
                 instrument_in.change(fn=_read_status, inputs=[instrument_in, workspace_in], outputs=status_out)
@@ -169,7 +174,7 @@ def build_ui():
                         lines.insert(1, f'(zobrazeno poslednich 20 z {n_npz})')
                     return '\n'.join(lines)
 
-                def run_extract(instrument, workspace, chunk_s, fp):
+                def run_extract(instrument, workspace, chunk_s, fp, device):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['extract', '--instrument', instrument, '--chunk-sec', str(int(chunk_s))]
@@ -186,114 +191,9 @@ def build_ui():
                 workspace_in.change(fn=read_ext_status,
                                     inputs=[instrument_in, workspace_in],
                                     outputs=ext_status_out)
-                ext_run.click(fn=run_extract,   inputs=[instrument_in, workspace_in, chunk_sec, force_pyin], outputs=ext_log)
+                ext_run.click(fn=run_extract,   inputs=[instrument_in, workspace_in, chunk_sec, force_pyin, device_dd], outputs=ext_log)
                 ext_stop.click(fn=stop_command, outputs=ext_log)
                 ext_timer.tick(fn=poll_log,     outputs=ext_log)
-
-            # -- Tab: DDSP Model --
-            with gr.Tab('DDSP Model'):
-                gr.Markdown(
-                    '### Trenovani DDSP modelu\n'
-                    'Ucí se syntetizovat timbre nastroje z extrakci (F0, hlasitost, velocity). '
-                    'Extrakce probehne automaticky pokud chybi. '
-                    'Po skonceni se spusti **EnvelopeNet** automaticky (viz zalozka EnvelopeNet).'
-                )
-                ddsp_status_out   = gr.Textbox(label='Stav modelu', lines=2,
-                                               interactive=False, max_lines=2)
-                ddsp_status_timer = gr.Timer(value=5)
-
-                def read_ddsp_status(instrument, workspace):
-                    if not instrument:
-                        return 'Zadejte adresar nastroje.'
-                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
-                    best_pt  = os.path.join(work_dir, 'checkpoints', 'best.pt')
-                    cfg_path = os.path.join(work_dir, 'instrument.json')
-                    if not os.path.exists(best_pt):
-                        return 'Nenatrenovano — checkpoint neexistuje.'
-                    trn = {}
-                    if os.path.exists(cfg_path):
-                        with open(cfg_path, encoding='utf-8') as f:
-                            trn = json.load(f).get('training', {})
-                    size   = trn.get('model_size') or json.load(open(cfg_path, encoding='utf-8')).get('model_size', '?') if os.path.exists(cfg_path) else '?'
-                    ep     = trn.get('epochs_completed', '?')
-                    bv     = trn.get('best_val', '?')
-                    ts     = trn.get('last_trained', '')
-                    mb     = os.path.getsize(best_pt) / 1e6
-                    return (f'HOTOVO  model={size}  ep={ep}  best_val={bv}  '
-                            f'[{ts}]\n'
-                            f'checkpoint: {best_pt}  ({mb:.1f} MB)')
-
-                ddsp_status_timer.tick(fn=read_ddsp_status,
-                                       inputs=[instrument_in, workspace_in],
-                                       outputs=ddsp_status_out)
-                instrument_in.change(fn=read_ddsp_status,
-                                     inputs=[instrument_in, workspace_in],
-                                     outputs=ddsp_status_out)
-                workspace_in.change(fn=read_ddsp_status,
-                                    inputs=[instrument_in, workspace_in],
-                                    outputs=ddsp_status_out)
-
-                with gr.Row():
-                    model_size = gr.Dropdown(
-                        ['small', 'medium', 'large'], value='small',
-                        label='Velikost modelu',
-                        info='small ~115K param (rychle CPU), medium ~452K, large ~2M'
-                    )
-                    epochs_sl  = gr.Slider(10, 500, value=100, step=10,
-                                           label='Pocet epoch',
-                                           info='1 epocha ≈ 6-18 min CPU, dle velikosti modelu')
-                    lr_sl      = gr.Slider(1e-5, 1e-3, value=3e-4, step=1e-5,
-                                           label='Learning rate',
-                                           info='Doporuceno: 3e-4; sniz pokud loss osciluje')
-                resume_chk = gr.Checkbox(
-                    label='Pokracovat od posledniho checkpointu (--resume)',
-                    info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
-                )
-                with gr.Row():
-                    lrn_run  = gr.Button('Spustit uceni', variant='primary')
-                    lrn_stop = gr.Button('Stop')
-                lrn_log   = gr.Textbox(label='Vystup', lines=12, interactive=False)
-                lrn_timer = gr.Timer(value=2)
-
-                gr.Markdown('#### train.log (posledni epochy)')
-                trainlog_out   = gr.Textbox(label='train.log', lines=12,
-                                            interactive=False, max_lines=12)
-                trainlog_timer = gr.Timer(value=3)
-
-                def run_learn(instrument, workspace, size, epochs, lr, resume):
-                    if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
-                    args = ['learn', '--instrument', instrument,
-                            '--model', size, '--epochs', str(int(epochs)),
-                            '--lr', f'{lr:.2e}']
-                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
-                    if resume: args.append('--resume')
-                    return run_command(args, lrn_log)
-
-                def read_train_log(instrument, workspace):
-                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
-                    log_path = os.path.join(work_dir, 'train.log')
-                    if not os.path.exists(log_path):
-                        return '(train.log nenalezen)'
-                    with open(log_path, encoding='utf-8', errors='replace') as f:
-                        lines = f.readlines()
-                    return ''.join(lines[-60:])
-
-                lrn_run.click(fn=run_learn,
-                               inputs=[instrument_in, workspace_in, model_size,
-                                       epochs_sl, lr_sl, resume_chk],
-                               outputs=lrn_log)
-                lrn_stop.click(fn=stop_command, outputs=lrn_log)
-                lrn_timer.tick(fn=poll_log, outputs=lrn_log)
-                trainlog_timer.tick(fn=read_train_log,
-                                    inputs=[instrument_in, workspace_in],
-                                    outputs=trainlog_out)
-                instrument_in.change(fn=read_train_log,
-                                     inputs=[instrument_in, workspace_in],
-                                     outputs=trainlog_out)
-                workspace_in.change(fn=read_train_log,
-                                    inputs=[instrument_in, workspace_in],
-                                    outputs=trainlog_out)
 
             # -- Tab: EnvelopeNet --
             with gr.Tab('EnvelopeNet'):
@@ -303,7 +203,7 @@ def build_ui():
                     '**Vstup:** (midi, velocity)  **Vystup:** tvar obalky + delka tonu\n\n'
                     'Pouziva warped casovou osu (power-law) pro jemne rozliseni attack faze '
                     '(~2 ms v prvnich 500 ms), a vazeny MSE loss pro zdurazneni attacku.\n'
-                    'Tréning je rychly (~minuty) a spusti se automaticky na konci `DDSP Model`.'
+                    '**Spust pred DDSP Model** (coupled mode) nebo samostatne kdykoli.'
                 )
                 env_status_out   = gr.Textbox(label='Stav EnvelopeNet', lines=2,
                                               interactive=False, max_lines=2)
@@ -367,7 +267,7 @@ def build_ui():
                 env_log   = gr.Textbox(label='Vystup', lines=15, interactive=False)
                 env_timer = gr.Timer(value=2)
 
-                def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w):
+                def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w, device):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['learn-envelope', '--instrument', instrument,
@@ -375,16 +275,127 @@ def build_ui():
                             '--lr', f'{lr:.2e}',
                             '--envelope-warp', f'{warp:.2f}',
                             '--n-env', str(int(n_env)),
-                            '--attack-weight', f'{atk_w:.2f}']
+                            '--attack-weight', f'{atk_w:.2f}',
+                            '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     return run_command(args, env_log)
 
                 env_run.click(fn=run_learn_envelope,
                                inputs=[instrument_in, workspace_in, env_epochs_sl,
-                                       env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl],
+                                       env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl,
+                                       device_dd],
                                outputs=env_log)
                 env_stop.click(fn=stop_command, outputs=env_log)
                 env_timer.tick(fn=poll_log, outputs=env_log)
+
+            # -- Tab: DDSP Model --
+            with gr.Tab('DDSP Model'):
+                gr.Markdown(
+                    '### Trenovani DDSP modelu\n'
+                    '**Decoupled timbre architektura**: sit se uci POUZE timbre (overtone balance, '
+                    'barvu zvuku) z F0 a velocity — bez hlasitosti. Hlasitostní obalka se aplikuje '
+                    'az po synteze jako linearni multiplikator (dB → linear scale).\n\n'
+                    'Tato architektura oddeluje "jak nastroj zní" od "jak hlasity je" — model se '
+                    'naucí cistou barvu zvuku nezavislou na dynamice. '
+                    'Extrakce probehne automaticky pokud chybi.'
+                )
+                ddsp_status_out   = gr.Textbox(label='Stav modelu', lines=2,
+                                               interactive=False, max_lines=2)
+                ddsp_status_timer = gr.Timer(value=5)
+
+                def read_ddsp_status(instrument, workspace):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje.'
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    best_pt  = os.path.join(work_dir, 'checkpoints', 'best.pt')
+                    cfg_path = os.path.join(work_dir, 'instrument.json')
+                    if not os.path.exists(best_pt):
+                        return 'Nenatrenovano — checkpoint neexistuje.'
+                    trn = {}
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, encoding='utf-8') as f:
+                            trn = json.load(f).get('training', {})
+                    size   = trn.get('model_size') or json.load(open(cfg_path, encoding='utf-8')).get('model_size', '?') if os.path.exists(cfg_path) else '?'
+                    ep     = trn.get('epochs_completed', '?')
+                    bv     = trn.get('best_val', '?')
+                    ts     = trn.get('last_trained', '')
+                    mb     = os.path.getsize(best_pt) / 1e6
+                    return (f'HOTOVO  model={size}  ep={ep}  best_val={bv}  '
+                            f'[{ts}]\n'
+                            f'checkpoint: {best_pt}  ({mb:.1f} MB)')
+
+                ddsp_status_timer.tick(fn=read_ddsp_status,
+                                       inputs=[instrument_in, workspace_in],
+                                       outputs=ddsp_status_out)
+                instrument_in.change(fn=read_ddsp_status,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=ddsp_status_out)
+                workspace_in.change(fn=read_ddsp_status,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=ddsp_status_out)
+
+                with gr.Row():
+                    model_size = gr.Dropdown(
+                        ['small', 'medium', 'large'], value='small',
+                        label='Velikost modelu',
+                        info='small ~115K param (rychle CPU), medium ~452K, large ~2M'
+                    )
+                    epochs_sl  = gr.Slider(10, 500, value=100, step=10,
+                                           label='Pocet epoch',
+                                           info='1 epocha ≈ 6-18 min CPU, dle velikosti modelu')
+                    lr_sl      = gr.Slider(1e-5, 1e-3, value=3e-4, step=1e-5,
+                                           label='Learning rate',
+                                           info='Doporuceno: 3e-4; sniz pokud loss osciluje')
+                resume_chk = gr.Checkbox(
+                    label='Pokracovat od posledniho checkpointu (--resume)',
+                    info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
+                )
+                with gr.Row():
+                    lrn_run  = gr.Button('Spustit uceni', variant='primary')
+                    lrn_stop = gr.Button('Stop')
+                lrn_log   = gr.Textbox(label='Vystup', lines=12, interactive=False)
+                lrn_timer = gr.Timer(value=2)
+
+                gr.Markdown('#### train.log (posledni epochy)')
+                trainlog_out   = gr.Textbox(label='train.log', lines=12,
+                                            interactive=False, max_lines=12)
+                trainlog_timer = gr.Timer(value=3)
+
+                def run_learn(instrument, workspace, size, epochs, lr, resume, device):
+                    if not instrument:
+                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                    args = ['learn', '--instrument', instrument,
+                            '--model', size, '--epochs', str(int(epochs)),
+                            '--lr', f'{lr:.2e}',
+                            '--device', device]
+                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
+                    if resume:  args.append('--resume')
+                    return run_command(args, lrn_log)
+
+                def read_train_log(instrument, workspace):
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    log_path = os.path.join(work_dir, 'train.log')
+                    if not os.path.exists(log_path):
+                        return '(train.log nenalezen)'
+                    with open(log_path, encoding='utf-8', errors='replace') as f:
+                        lines = f.readlines()
+                    return ''.join(lines[-60:])
+
+                lrn_run.click(fn=run_learn,
+                               inputs=[instrument_in, workspace_in, model_size,
+                                       epochs_sl, lr_sl, resume_chk, device_dd],
+                               outputs=lrn_log)
+                lrn_stop.click(fn=stop_command, outputs=lrn_log)
+                lrn_timer.tick(fn=poll_log, outputs=lrn_log)
+                trainlog_timer.tick(fn=read_train_log,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=trainlog_out)
+                instrument_in.change(fn=read_train_log,
+                                     inputs=[instrument_in, workspace_in],
+                                     outputs=trainlog_out)
+                workspace_in.change(fn=read_train_log,
+                                    inputs=[instrument_in, workspace_in],
+                                    outputs=trainlog_out)
 
             # -- Tab: Generovani --
             with gr.Tab('Generovani'):
@@ -472,12 +483,13 @@ def build_ui():
 
                 def run_generate(instrument, workspace, full_range, midi_lo, midi_hi,
                                  vel_layers, env_src, atk_ramp, wet, notes, vel,
-                                 output, no_skip_val):
+                                 output, no_skip_val, device):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['generate', '--instrument', instrument,
                             '--envelope-source', env_src,
-                            '--attack-ramp-ms', str(int(atk_ramp))]
+                            '--attack-ramp-ms', str(int(atk_ramp)),
+                            '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if full_range:
                         args += ['--full-range',
@@ -496,7 +508,8 @@ def build_ui():
                                inputs=[instrument_in, workspace_in, full_range_chk,
                                        midi_lo_sl, midi_hi_sl, vel_layers_sl,
                                        env_source_radio, attack_ramp_sl,
-                                       wet_sl, notes_in, vel_in, output_in, no_skip],
+                                       wet_sl, notes_in, vel_in, output_in, no_skip,
+                                       device_dd],
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
                 gen_timer.tick(fn=poll_log, outputs=gen_log)

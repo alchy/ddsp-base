@@ -83,6 +83,17 @@ class Workspace:
             os.makedirs(d, exist_ok=True)
 
 
+def resolve_device(requested: str = 'auto') -> 'torch.device':
+    """Return torch.device from 'auto' | 'cpu' | 'mps' | 'cuda'."""
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+            return torch.device('mps')
+        return torch.device('cpu')
+    return torch.device(requested)
+
+
 def make_workspace(instrument: str, workspace: str = None) -> Workspace:
     source_dir = os.path.abspath(instrument)
     if workspace:
@@ -283,6 +294,7 @@ class SourceDataset(Dataset):
         self.hop   = FRAME_HOP
         self.items = []
         self.data  = []
+        self.midi_per_file = []   # midi note per NPZ file (for coupled training)
         npz_files  = sorted(glob.glob(os.path.join(extracts_dir, '*.npz')))
         if not npz_files:
             raise FileNotFoundError(
@@ -295,6 +307,8 @@ class SourceDataset(Dataset):
             raw = np.load(path)
             d   = {k: raw[k].copy() for k in raw.files}
             self.data.append(d)
+            parsed = parse_filename(path)
+            self.midi_per_file.append(parsed[0] if parsed else 60)
             T   = len(d['f0'])
             if T < self.crop + 1:
                 continue
@@ -329,9 +343,12 @@ class SourceDataset(Dataset):
             g   = 10.0 ** (db / 20.0)
             audio = audio * g; loL += db; loR += db
         vel_mean = float(d['vel_frames'][sl].mean())
+        midi     = self.midi_per_file[fi]
         return (torch.from_numpy(f0), torch.from_numpy(loL), torch.from_numpy(loR),
                 torch.from_numpy(vp), torch.from_numpy(audio),
-                torch.tensor(vel_mean, dtype=torch.float32))
+                torch.tensor(vel_mean, dtype=torch.float32),
+                torch.tensor(midi,     dtype=torch.long),
+                torch.tensor(start,    dtype=torch.long))
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +518,26 @@ def cmd_learn(args):
         print('[ddsp learn] No extracts found -- running extraction first.')
         extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=60)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     print(f'[ddsp learn]  instrument={ws.name}  model={model_size}  device={device}')
     print(f'              source  -> {ws.source_dir}')
     print(f'              work    -> {ws.work_dir}')
+
+    # --- coupled mode: train EnvelopeNet first, then use its predictions during DDSP training ---
+    coupled   = getattr(args, 'coupled', False)
+    env_mix   = getattr(args, 'env_mix', 0.5)   # fraction of batches using EnvelopeNet loudness
+    env_model = None
+    if coupled:
+        env_pt = os.path.join(ws.checkpoints_dir, 'envelope.pt')
+        if not os.path.exists(env_pt):
+            print('[ddsp learn]  Coupled mode: EnvelopeNet not found — training first...')
+            os.makedirs(ws.checkpoints_dir, exist_ok=True)
+            train_envelope_model(ws.extracts_dir, ws.checkpoints_dir, device=device,
+                                 epochs=1000, lr=1e-3,
+                                 warp=ENVELOPE_WARP, n_env=N_ENV, attack_weight=5.0)
+        env_model = load_envelope_model(env_pt, device)
+        print(f'[ddsp learn]  Coupled mode: env_mix={env_mix:.0%}  '
+              f'(n_env={env_model.n_env}  warp={env_model._warp})')
 
     dataset = SourceDataset(ws.extracts_dir, min_voiced=args.min_voiced)
     n_val   = max(1, int(len(dataset) * 0.08))
@@ -538,13 +571,38 @@ def cmd_learn(args):
     log_f = open(ws.log_path, 'a', buffering=1)
     log_f.write(f'\n--- {_now()}  model={model_size}  epochs={args.epochs}  lr={args.lr} ---\n')
 
+    def _get_loudness(loL, loR, vel_b, midi_b, start_b):
+        """Return loudness tensor for a batch.
+        Coupled mode: with probability env_mix, replace real NPZ loudness with
+        EnvelopeNet prediction (sliced to the same crop window).
+        """
+        lo_real = (loL + loR) * 0.5   # (B, CROP_FRAMES) from NPZ
+        if env_model is None or random.random() >= env_mix:
+            return lo_real.to(device)
+        lo_list = []
+        for b in range(lo_real.shape[0]):
+            midi_i  = int(midi_b[b].item())
+            vel_i   = round(float(vel_b[b].item()))
+            st      = int(start_b[b].item())
+            env_arr = env_model.predict_envelope(midi_i, vel_i, warp=env_model._warp)
+            end     = st + CROP_FRAMES
+            if len(env_arr) >= end:
+                chunk = env_arr[st:end]
+            else:
+                chunk = np.pad(env_arr, (0, max(0, end - len(env_arr))),
+                               constant_values=-80.0)[st:end]
+            lo_list.append(torch.from_numpy(chunk))
+        return torch.stack(lo_list).to(device)
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
         model.train()
         t0, train_losses = time.time(), []
-        for f0, loL, loR, vp, audio, vel in train_loader:
-            f0, loL, loR = f0.to(device), loL.to(device), loR.to(device)
-            audio, vel   = audio.to(device), vel.to(device)
-            pred  = model(f0, (loL + loR) * 0.5, vel, CROP_FRAMES)
+        for f0, loL, loR, vp, audio, vel, midi_b, start_b in train_loader:
+            f0    = f0.to(device)
+            audio = audio.to(device)
+            vel   = vel.to(device)
+            lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
+            pred  = model(f0, lo, vel, CROP_FRAMES)
             loss  = mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -555,10 +613,12 @@ def cmd_learn(args):
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for f0, loL, loR, vp, audio, vel in val_loader:
-                f0, loL, loR = f0.to(device), loL.to(device), loR.to(device)
-                audio, vel   = audio.to(device), vel.to(device)
-                pred = model(f0, (loL + loR) * 0.5, vel, CROP_FRAMES)
+            for f0, loL, loR, vp, audio, vel, midi_b, start_b in val_loader:
+                f0    = f0.to(device)
+                audio = audio.to(device)
+                vel   = vel.to(device)
+                lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
+                pred  = model(f0, lo, vel, CROP_FRAMES)
                 val_losses.append((mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)).item())
 
         tl, vl  = float(np.mean(train_losses)), float(np.mean(val_losses))
@@ -712,7 +772,7 @@ def cmd_learn_envelope(args):
         print('[learn-envelope] Run: python ddsp.py extract --instrument <path>')
         sys.exit(1)
     os.makedirs(ws.checkpoints_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     print(f'[learn-envelope]  instrument={ws.name}  device={device}')
     train_envelope_model(ws.extracts_dir, ws.checkpoints_dir,
                          epochs=args.epochs, lr=args.lr,
@@ -738,7 +798,7 @@ def cmd_generate(args):
         print('[ddsp generate] Run: python ddsp.py learn --instrument <path>')
         sys.exit(1)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(getattr(args, 'device', 'auto'))
     model  = build_ddsp(size=model_size).to(device)
     model.load_state_dict(torch.load(best_pt, map_location=device, weights_only=True))
     model.eval()
@@ -970,6 +1030,15 @@ def main():
     p_lrn.add_argument('--batch-size', type=int,   default=4, dest='batch_size')
     p_lrn.add_argument('--min-voiced', type=float, default=0.1, dest='min_voiced',
                        help='Minimum voiced frame fraction per window (default: 0.1)')
+    p_lrn.add_argument('--coupled', action='store_true',
+                       help='Coupled mode: train EnvelopeNet first, then use its loudness '
+                            'predictions during DDSP training (aligns train/inference distributions)')
+    p_lrn.add_argument('--env-mix', type=float, default=0.5, dest='env_mix',
+                       help='Fraction of training batches using EnvelopeNet loudness in '
+                            'coupled mode (default: 0.5)')
+    p_lrn.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- generate ---
     p_gen = subs.add_parser('generate', help='Generate sample bank from trained model')
@@ -1002,6 +1071,9 @@ def main():
     p_gen.add_argument('--attack-ramp-ms', type=float, default=10.0,
                        dest='attack_ramp_ms',
                        help='Hard onset ramp length in ms (0=off, default: 10)')
+    p_gen.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- learn-envelope ---
     p_env = subs.add_parser('learn-envelope',
@@ -1021,6 +1093,9 @@ def main():
     p_env.add_argument('--attack-weight', type=float, default=5.0,
                        dest='attack_weight',
                        help='MSE weight multiplier for attack region (default: 5.0)')
+    p_env.add_argument('--device', default='auto',
+                       choices=['auto', 'cpu', 'mps', 'cuda'],
+                       help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
 
     # --- status ---
     p_sts = subs.add_parser('status', help='Show instrument training status')
