@@ -141,7 +141,54 @@ Pokud zlepšení bude marginální → přeskočit na dev-frame-rate bez další
 
 ---
 
-### 3. [dev-noise-amp] Globální amplituda šumové složky
+### 3. [dev-unison-spread] Unison spread — rozladění strun
+
+**Fyzika**: piano má 2 struny v basovém rejstříku, 3 ve středním a vysokém.
+Každá struna je záměrně naladěna o ~0.3–2 cent jinak → **beating** mezi strunami
+= charakteristická "živost" a "dýchání" sustainu. Aktuální model má jeden oscilátor
+na parciál → sustain je statický, nemá chorusing.
+
+**Co to není**: nejde o inharmonicitu (B koeficient) ani o transient — je to steady-state
+jev přítomný po celou dobu tónu, nejsilnější v basech.
+
+**Implementace**: zdvojení oscilátorů s learned detuning `delta` per nota:
+
+```python
+# DDSPVocoder.__init__
+self.head_detune = nn.Linear(mlp_dim, 1)
+nn.init.constant_(self.head_detune.bias, -6.0)   # sigmoid ≈ 0.002 → delta ≈ 0 na startu
+
+# DDSPVocoder.forward
+DELTA_MAX = 0.003    # ~5 cent horní mez (fyzikálně: basy až 2 cent, treble 0.3 cent)
+delta = torch.sigmoid(self.head_detune(feat)).squeeze(-1).mean(dim=1) * DELTA_MAX
+
+# HarmonicSynth.forward — přidat druhý oscilátor s f * (1 + delta)
+inst_freq_A = f0_up.unsqueeze(1) * (k * stretch).unsqueeze(2)
+inst_freq_B = inst_freq_A * (1.0 + delta.view(B, 1, 1))
+phase_A = torch.cumsum(2π * inst_freq_A / SR, dim=-1)
+phase_B = torch.cumsum(2π * inst_freq_B / SR, dim=-1)
+signal  = (a * (torch.sin(phase_A) + torch.sin(phase_B))).sum(dim=1) / (2 * N)
+```
+
+**Výsledek**: beating frekvence = `delta * f_k` → pro A4 (440 Hz) a delta=0.001
+beat na k=1: 0.44 Hz, k=10: 4.4 Hz — přesně v rozsahu slyšitelného "live" efektu.
+
+**Poznámky**:
+- `delta` je MIDI-independent na začátek; pokud basy potřebují výrazně jiný rozsah
+  než výšky, přidat analogický MIDI-dependent prior jako u B_MAX
+- Alternativa s amplitudovým poměrem (`a1 : a2 = 1:1` vs. `1:0.7`): možné rozšíření,
+  ale pravděpodobně není potřeba — model má `head_harm` k vyvážení
+- Výpočetní cena: 2× více cumsum + sin v HarmonicSynth (~+30 % inference time)
+- GUI slider `unison_scale` (0–2), analogicky jako `inh_scale`
+
+**Zaparkováno — transient spectral evolution**: časově proměnné B při útoku kladívka
+(nelinearita kontaktu → rychlá spektrální evoluce prvních 5–20 ms) vyžaduje time-varying
+B(t) místo poolovaného skaláru + dev-frame-rate pro dostatečné časové rozlišení.
+Implementovat až po dev-frame-rate.
+
+---
+
+### 4. [dev-noise-amp] Globální amplituda šumové složky
 
 **Problém**: po zavedení `head_amp_L/R` pro harmonické vznikla asymetrie —
 noise nemá globální scalar, model musí ladit všech 129 binů najednou.
@@ -158,7 +205,8 @@ Vhodné kombinovat s jiným branchem.
 
 ## Poznámky
 
-- Každá změna architektury (dev-frame-rate, dev-inharmonicity, dev-noise-amp) = nové checkpointy
+- Každá změna architektury = nové checkpointy (dev-frame-rate, dev-unison-spread, dev-noise-amp)
 - dev-attack-loss je zpětně kompatibilní (pouze loss funkce)
 - Testovat vždy small model (50 epoch) před medium (300 epoch)
-- dev-frame-rate je preferovaný hlavní směr; ostatní kroky jsou buď rychlé testy nebo doplňky
+- dev-frame-rate je preferovaný hlavní směr pro attack; dev-unison-spread pro sustain živost
+- Transient spectral evolution (time-varying B) zaparkováno — závisí na dev-frame-rate
