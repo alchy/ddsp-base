@@ -2,14 +2,18 @@
 model_ddsp.py - DDSP Neural Vocoder
 
 Signal model:
-    φ_k(t) = cumsum(2π·k·F0(t)/SR)                  [phase accumulation, correct for time-varying F0]
+    φ_k(t) = cumsum(2π · f_k(t) / SR)               [phase accumulation]
+    f_k(t) = k · F0(t) · √(1 + inh · k²)            [inharmonic partial frequencies]
     L(t) = A_L(t) · Σ_k  d_k_L(t) · sin(φ_k(t))   [harmonic oscillators, left]
          + noise_STFT_shaped_L(t)                     [filtered noise, left]
     R(t) = A_R(t) · Σ_k  d_k_R(t) · sin(φ_k(t))   [harmonic oscillators, right]
          + noise_STFT_shaped_R(t)                     [filtered noise, right]
 
-where d_k (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
-      A   (global amplitude)       = softplus(head_amp)
+where d_k  (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
+      A    (global amplitude)       = softplus(head_amp)
+      inh  (inharmonicity coeff)    = sigmoid(head_B).mean(T) × B_MAX(f0)
+           B_MAX(f0) = 0.0008 · exp(-(midi(f0) − 21) / 88 · ln10)
+           pools over time → single scalar per note, physically correct
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -99,21 +103,35 @@ class HarmonicSynth(nn.Module):
     Output: (B, 1, n_samples)
     """
 
-    def forward(self, harm_amps, f0_hz, n_samples):
+    def forward(self, harm_amps, f0_hz, n_samples, inh=None):
+        """
+        harm_amps : (B, T, N)
+        f0_hz     : (B, T)
+        n_samples : int
+        inh       : (B,) inharmonicity coefficient per item, or None (= pure harmonic)
+                    f_k = k · f0 · √(1 + inh · k²)
+        """
         B, T_frames, N = harm_amps.shape
         device = harm_amps.device
 
         a     = F.interpolate(harm_amps.permute(0, 2, 1), size=n_samples, mode='linear', align_corners=False)
         f0_up = F.interpolate(f0_hz.unsqueeze(1).float(), size=n_samples, mode='linear', align_corners=False).squeeze(1)
 
-        k = torch.arange(1, N + 1, dtype=torch.float32, device=device)
-        inst_freq = f0_up.unsqueeze(1) * k.unsqueeze(0).unsqueeze(2)
+        k = torch.arange(1, N + 1, dtype=torch.float32, device=device)   # (N,)
+
+        if inh is not None:
+            # Piano inharmonicity: partial k is at k·f0·√(1 + inh·k²)
+            # inh: (B,) → (B, N)
+            stretch = torch.sqrt(1.0 + inh.unsqueeze(1) * k ** 2)        # (B, N)
+            # inst_freq: (B, N, n_samples)
+            inst_freq = f0_up.unsqueeze(1) * (k.unsqueeze(0) * stretch).unsqueeze(2)
+        else:
+            inst_freq = f0_up.unsqueeze(1) * k.unsqueeze(0).unsqueeze(2)
 
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
         # Phase accumulation: cumsum over instantaneous frequency (correct for time-varying F0)
-        # inst_freq shape: (B, N, n_samples)  units: Hz
         phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
@@ -195,6 +213,12 @@ class DDSPVocoder(nn.Module):
         self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
         self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
 
+        # Piano inharmonicity: single scalar B per note (pooled over T)
+        # f_k = k·f0·√(1 + B·k²),  B_MAX is MIDI-dependent (see forward)
+        # init bias=-5 → sigmoid≈0.007 → B≈0 at start (safe, no pitch disruption)
+        self.head_B = nn.Linear(mlp_dim, 1)
+        nn.init.constant_(self.head_B.bias, -5.0)
+
         self.harm_synth  = HarmonicSynth()
         self.noise_synth = NoiseSynth()
 
@@ -232,9 +256,16 @@ class DDSPVocoder(nn.Module):
         noise_L     = torch.sigmoid(self.head_noise_L(feat))
         noise_R     = torch.sigmoid(self.head_noise_R(feat))
 
+        # Inharmonicity: MIDI-dependent B_MAX from mean F0, pooled scalar per note
+        # B_MAX = 0.0008 · exp(-(midi-21)/88·ln10)  — basy ~0.0008, výšky ~0.00008
+        f0_mean  = f0_hz.clamp(min=F0_MIN).mean(dim=1)                          # (B,)
+        midi_est = 69.0 + 12.0 * torch.log2(f0_mean / 440.0)                   # (B,)
+        b_max    = 0.0008 * torch.exp(-(midi_est - 21.0) / 88.0 * math.log(10.0))
+        inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) * b_max  # (B,)
+
         n_samples   = n_frames * FRAME_HOP
-        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples)
-        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples)
+        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh)
+        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh=inh)
         noise_sig_L = self.noise_synth(noise_L, n_samples)
         noise_sig_R = self.noise_synth(noise_R, n_samples)
 
