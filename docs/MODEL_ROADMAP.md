@@ -80,9 +80,17 @@ inst_freq = f0_up.unsqueeze(1) * k * stretch.unsqueeze(2)
 Pokud fixed baseline (A) dá skoro stejný poslechový benefit jako learned (B),
 je levnější, stabilnější a interpretovatelný. Learned varianta je správný finální cíl.
 
-> **B_MAX = 0.0002** je konzervativní výchozí hodnota bezpečná pro celý rozsah.
-> Pro basové registry může být příliš těsná (slyšitelný efekt malý). Pokud branch funguje
-> ale efekt není slyšet, vyzkoušet `B_MAX = 0.0005–0.001` nebo MIDI-dependent prior.
+> **B_MAX = 0.0002** je konzervativní výchozí hodnota. Reálné hodnoty pro grand piano
+> jsou přibližně 0.0001–0.0008 podle rejstříku (basy vyšší, výšky nižší).
+> Lepší alternativa než jeden globální bound je **MIDI-dependent prior**:
+> `B(midi) = B_0 · exp(-(midi − 21) / 88 · ln(10))` — fyzikálně přesnější a automaticky
+> škáluje s rejstříkem bez nutnosti ruční kalibrace. Pokud efekt nebude slyšet,
+> není chyba v architektuře — je to příliš těsný bound.
+
+**Vazba na attack**: inharmonicita může pomoci bright attacku více než dev-attack-loss,
+protože vyšší parciály bez inharmonicity "splývají" v čase a MRSTFT je netrestá
+bez ohledu na váhování. Pořadí attack-loss → inharmonicity je rozumné pro rychlé
+ověření, ale pokud attack-loss přinese jen marginální zlepšení, přeskočit rovnou sem.
 
 ---
 
@@ -144,6 +152,12 @@ loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_
 > tedy to, že model má kapacitu na bright attack, ale loss ho k tomu netlačí.
 > Neřeší fyzikální inharmonicitu horních partials. Pokud se po tomto kroku attack zlepší,
 > ale stále chybí „strunová kovovost", není to selhání branch — je to signál pro dev-inharmonicity.
+
+**Otevřená pochybnost**: výše uvedená hypotéza ("model umí, loss netlačí") nemusí být pravdivá.
+Alternativa: frame-rate interpolace harmonických amplitud (5ms/frame) + STFT loss na 48kHz
+může mít fundamentálně nedostatečné časové rozlišení pro onset bez ohledu na váhování.
+V tom případě attack-loss pomůže jen částečně. Pokud zlepšení bude marginální,
+přeskočit rovnou na dev-inharmonicity bez dalšího ladění tohoto kroku.
 
 ---
 
