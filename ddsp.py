@@ -837,6 +837,12 @@ def cmd_generate(args):
             if m is None:
                 print(f'[ddsp generate] ERROR: unknown note "{n}"'); sys.exit(1)
             note_set.add(m)
+        available = {(parse_filename(f) or [60])[0] for f in src_list}
+        missing   = [n for n, m in zip(args.notes, [parse_note_name(x) for x in args.notes])
+                     if m not in available]
+        if missing:
+            print(f'[ddsp generate] WARNING: tyto noty nejsou v datasetu: {" ".join(missing)}'
+                  f'  (pouzij full-range mod pro syntezu libovolne noty)')
     if args.vel:
         vel_set = set(int(v) for v in args.vel)
     if note_set:
@@ -961,7 +967,7 @@ def cmd_generate(args):
             print(f'  ERROR {out_name}: {exc}')
     print(f'\n[ddsp generate]  done: {done}/{total}')
 
-    cfg.update({'generated': {'n_files': done, 'wet': wet,
+    cfg.update({'generated': {'n_files': done,
                                'output_dir': output_dir, 'generated_at': _now()}})
     save_config(ws, cfg)
 
