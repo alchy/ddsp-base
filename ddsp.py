@@ -355,6 +355,30 @@ class SourceDataset(Dataset):
 # Loss
 # ---------------------------------------------------------------------------
 
+def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
+    """Attack-emphasis weight upsampled to sample level.
+
+    lo_db   : (B, F) loudness in dB per frame
+    returns : (B, 1, n_samples) weight tensor, floor=1.0, peak=1+alpha
+    """
+    B, n_frames = lo_db.shape
+    # Gaussian smooth along time
+    radius = int(4 * sigma + 0.5)
+    k = torch.arange(-radius, radius + 1, dtype=lo_db.dtype, device=lo_db.device)
+    kernel = torch.exp(-0.5 * (k / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    lo_smooth = F.conv1d(lo_db.unsqueeze(1), kernel.view(1, 1, -1), padding=radius).squeeze(1)
+    # Positive derivative = attack
+    dl = torch.diff(lo_smooth, prepend=lo_smooth[:, :1], dim=1)
+    dl_pos = dl.clamp(min=0.0)
+    dl_norm = dl_pos / (dl_pos.amax(dim=1, keepdim=True) + 1e-6)
+    attack_w = 1.0 + alpha * dl_norm                        # (B, F)
+    # Upsample to sample resolution
+    w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples,
+                         mode='linear', align_corners=False)  # (B, 1, n_samples)
+    return w_up
+
+
 def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096)):
     B, C, T = pred.shape
     p_flat  = pred.reshape(B * C, T)
@@ -604,7 +628,9 @@ def cmd_learn(args):
             vel   = vel.to(device)
             lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
             pred  = model(f0, lo, vel, CROP_FRAMES)
-            loss  = mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
+            aw    = _attack_weight(lo, pred.shape[-1])
+            loss  = (mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
+                     + 0.3 * mrstft_loss(pred * aw, audio * aw))
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -620,7 +646,9 @@ def cmd_learn(args):
                 vel   = vel.to(device)
                 lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
                 pred  = model(f0, lo, vel, CROP_FRAMES)
-                val_losses.append((mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)).item())
+                aw    = _attack_weight(lo, pred.shape[-1])
+                val_losses.append((mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
+                                   + 0.3 * mrstft_loss(pred * aw, audio * aw)).item())
 
         tl, vl  = float(np.mean(train_losses)), float(np.mean(val_losses))
         elapsed = time.time() - t0

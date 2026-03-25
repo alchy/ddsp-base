@@ -32,13 +32,24 @@ def _run_ddsp(args_list: list, log_queue: list, stop_event: threading.Event):
         text=True, bufsize=1, encoding='utf-8', errors='replace',
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
+
+    def _killer():
+        stop_event.wait()       # blokuje dokud neni nastaveno
+        if proc.poll() is None:
+            proc.terminate()
+            time.sleep(1.5)
+            if proc.poll() is None:
+                proc.kill()
+
+    threading.Thread(target=_killer, daemon=True).start()
+
     for line in proc.stdout:
         log_queue.append(line.rstrip())
-        if stop_event.is_set():
-            proc.terminate()
-            break
     proc.wait()
-    log_queue.append(f'\n[exit code {proc.returncode}]')
+    if stop_event.is_set():
+        log_queue.append('\n[zastaveno uzivatelem]')
+    else:
+        log_queue.append(f'\n[exit code {proc.returncode}]')
 
 
 def _read_status(instrument_dir: str, workspace_dir: str = '') -> str:
@@ -93,6 +104,10 @@ def build_ui():
             return 'Jiny prikaz jiz bezi. Pockejte nebo stisknete Stop.'
         _current['log'].clear()
         _current['stop'].clear()
+        script = os.path.basename(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ddsp.py'))
+        _current['log'].append('$ python ' + script + ' ' + ' '.join(args_list))
+        _current['log'].append('')
         t = threading.Thread(target=_run_ddsp,
                               args=(args_list, _current['log'], _current['stop']),
                               daemon=True)
