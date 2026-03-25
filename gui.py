@@ -104,10 +104,6 @@ def build_ui():
             return 'Jiny prikaz jiz bezi. Pockejte nebo stisknete Stop.'
         _current['log'].clear()
         _current['stop'].clear()
-        script = os.path.basename(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ddsp.py'))
-        _current['log'].append('$ python ' + script + ' ' + ' '.join(args_list))
-        _current['log'].append('')
         t = threading.Thread(target=_run_ddsp,
                               args=(args_list, _current['log'], _current['stop']),
                               daemon=True)
@@ -189,13 +185,16 @@ def build_ui():
                         lines.insert(1, f'(zobrazeno poslednich 20 z {n_npz})')
                     return '\n'.join(lines)
 
+                ext_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
+
                 def run_extract(instrument, workspace, chunk_s, fp, device):
                     if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                        return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['extract', '--instrument', instrument, '--chunk-sec', str(int(chunk_s))]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if fp: args.append('--force-pyin')
-                    return run_command(args, ext_log)
+                    cmd_str = 'python ddsp.py ' + ' '.join(args)
+                    return cmd_str, run_command(args, ext_log)
 
                 ext_status_timer.tick(fn=read_ext_status,
                                       inputs=[instrument_in, workspace_in],
@@ -206,7 +205,7 @@ def build_ui():
                 workspace_in.change(fn=read_ext_status,
                                     inputs=[instrument_in, workspace_in],
                                     outputs=ext_status_out)
-                ext_run.click(fn=run_extract,   inputs=[instrument_in, workspace_in, chunk_sec, force_pyin, device_dd], outputs=ext_log)
+                ext_run.click(fn=run_extract,   inputs=[instrument_in, workspace_in, chunk_sec, force_pyin, device_dd], outputs=[ext_cmd_out, ext_log])
                 ext_stop.click(fn=stop_command, outputs=ext_log)
                 ext_timer.tick(fn=poll_log,     outputs=ext_log)
 
@@ -276,6 +275,7 @@ def build_ui():
                                               label='Attack weight (MSE)',
                                               info='Nasobitel chyby v attack oblasti (prvni ~4% '
                                                    'bodu). 5.0 = attack prispiva 5x vice do loss.')
+                env_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
                 with gr.Row():
                     env_run  = gr.Button('Spustit trenovani EnvelopeNet', variant='primary')
                     env_stop = gr.Button('Stop')
@@ -284,7 +284,7 @@ def build_ui():
 
                 def run_learn_envelope(instrument, workspace, epochs, lr, warp, n_env, atk_w, device):
                     if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                        return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['learn-envelope', '--instrument', instrument,
                             '--epochs', str(int(epochs)),
                             '--lr', f'{lr:.2e}',
@@ -293,13 +293,14 @@ def build_ui():
                             '--attack-weight', f'{atk_w:.2f}',
                             '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
-                    return run_command(args, env_log)
+                    cmd_str = 'python ddsp.py ' + ' '.join(args)
+                    return cmd_str, run_command(args, env_log)
 
                 env_run.click(fn=run_learn_envelope,
                                inputs=[instrument_in, workspace_in, env_epochs_sl,
                                        env_lr_sl, env_warp_sl, env_nenv_sl, env_atk_w_sl,
                                        device_dd],
-                               outputs=env_log)
+                               outputs=[env_cmd_out, env_log])
                 env_stop.click(fn=stop_command, outputs=env_log)
                 env_timer.tick(fn=poll_log, outputs=env_log)
 
@@ -365,6 +366,7 @@ def build_ui():
                     label='Pokracovat od posledniho checkpointu (--resume)',
                     info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
                 )
+                lrn_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
                 with gr.Row():
                     lrn_run  = gr.Button('Spustit uceni', variant='primary')
                     lrn_stop = gr.Button('Stop')
@@ -378,14 +380,15 @@ def build_ui():
 
                 def run_learn(instrument, workspace, size, epochs, lr, resume, device):
                     if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                        return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['learn', '--instrument', instrument,
                             '--model', size, '--epochs', str(int(epochs)),
                             '--lr', f'{lr:.2e}',
                             '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if resume:  args.append('--resume')
-                    return run_command(args, lrn_log)
+                    cmd_str = 'python ddsp.py ' + ' '.join(args)
+                    return cmd_str, run_command(args, lrn_log)
 
                 def read_train_log(instrument, workspace):
                     work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
@@ -399,7 +402,7 @@ def build_ui():
                 lrn_run.click(fn=run_learn,
                                inputs=[instrument_in, workspace_in, model_size,
                                        epochs_sl, lr_sl, resume_chk, device_dd],
-                               outputs=lrn_log)
+                               outputs=[lrn_cmd_out, lrn_log])
                 lrn_stop.click(fn=stop_command, outputs=lrn_log)
                 lrn_timer.tick(fn=poll_log, outputs=lrn_log)
                 trainlog_timer.tick(fn=read_train_log,
@@ -491,6 +494,7 @@ def build_ui():
                     info=f'Vychozi: {ITHACA_ROOT}\\<nastroj>\\  '
                          r'Muze byt relativni i absolutni cesta.'
                 )
+                gen_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
                 with gr.Row():
                     gen_run  = gr.Button('Generovat', variant='primary')
                     gen_stop = gr.Button('Stop')
@@ -501,7 +505,7 @@ def build_ui():
                                  vel_layers, env_src, atk_ramp, wet, inh_scale,
                                  notes, output, no_skip_val, device):
                     if not instrument:
-                        return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
+                        return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['generate', '--instrument', instrument,
                             '--envelope-source', env_src,
                             '--attack-ramp-ms', str(int(atk_ramp)),
@@ -518,7 +522,8 @@ def build_ui():
                         if notes.strip(): args += ['--notes'] + notes.split()
                     if (output or '').strip(): args += ['--output', output.strip()]
                     if no_skip_val:      args.append('--no-skip')
-                    return run_command(args, gen_log)
+                    cmd_str = 'python ddsp.py ' + ' '.join(args)
+                    return cmd_str, run_command(args, gen_log)
 
                 gen_run.click(fn=run_generate,
                                inputs=[instrument_in, workspace_in, full_range_chk,
@@ -526,7 +531,7 @@ def build_ui():
                                        env_source_radio, attack_ramp_sl,
                                        wet_sl, inh_scale_sl, notes_in,
                                        output_in, no_skip, device_dd],
-                               outputs=gen_log)
+                               outputs=[gen_cmd_out, gen_log])
                 gen_stop.click(fn=stop_command, outputs=gen_log)
                 gen_timer.tick(fn=poll_log, outputs=gen_log)
                 # gen_status wiring — output_in must be defined first
