@@ -835,8 +835,12 @@ def cmd_generate(args):
             note_set.add(m)
         wav_files = [f for f in wav_files if (parse_filename(f) or [60])[0] in note_set]
     if args.vel:
-        vel_set   = set(args.vel)
+        vel_set   = set(int(v) for v in args.vel)
         wav_files = [f for f in wav_files if (parse_filename(f) or [0, None])[1] in vel_set]
+
+    if (args.notes or args.vel) and not wav_files:
+        print('[ddsp generate] ERROR: zadne soubory neodpovidaji filtru notes/vel')
+        sys.exit(1)
 
     ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
     output_dir = args.output or ithaca_out
@@ -926,7 +930,8 @@ def cmd_generate(args):
         out_name = os.path.basename(wav_path)
         out_path = os.path.join(output_dir, out_name)
         if skip and os.path.exists(out_path):
-            done += 1; continue
+            print(f'  [skip] {out_name}')
+            continue
         parsed    = parse_filename(wav_path)
         midi      = parsed[0] if parsed else 60
         vel_layer = parsed[1] if parsed else 0
