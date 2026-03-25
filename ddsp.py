@@ -820,12 +820,20 @@ def cmd_generate(args):
     attack_ramp_ms = getattr(args, 'attack_ramp_ms', 10)
     inh_scale      = float(getattr(args, 'inh_scale', 1.0))
 
-    wav_files = scan_instrument_dir(ws.source_dir)
-    if not wav_files:
-        print(f'[ddsp generate] ERROR: no WAV files in {ws.source_dir}')
-        sys.exit(1)
+    wav_files  = scan_instrument_dir(ws.source_dir)
+    npz_mode   = not wav_files  # fallback: generate from NPZ cache when source WAVs missing
+    if npz_mode:
+        print(f'[ddsp generate] INFO: zdrojove WAV nenalezeny — pouzivam NPZ cache jako zdroj')
+        npz_files = sorted(glob.glob(os.path.join(ws.extracts_dir, '*.npz')))
+        if not npz_files:
+            print(f'[ddsp generate] ERROR: ani WAV ani NPZ soubory nejsou k dispozici')
+            sys.exit(1)
+        # Use only _chunk000 (= full file) to avoid duplicates; fall back to any if no chunks
+        chunk0 = [f for f in npz_files if '_chunk000' in os.path.basename(f)]
+        npz_files = chunk0 if chunk0 else npz_files
 
-    # Filters
+    # Filters — apply to wav_files (standard) or npz_files (npz_mode)
+    note_set, vel_set = None, None
     if args.notes:
         note_set = set()
         for n in args.notes:
@@ -833,14 +841,25 @@ def cmd_generate(args):
             if m is None:
                 print(f'[ddsp generate] ERROR: unknown note "{n}"'); sys.exit(1)
             note_set.add(m)
-        wav_files = [f for f in wav_files if (parse_filename(f) or [60])[0] in note_set]
     if args.vel:
-        vel_set   = set(int(v) for v in args.vel)
-        wav_files = [f for f in wav_files if (parse_filename(f) or [0, None])[1] in vel_set]
+        vel_set = set(int(v) for v in args.vel)
 
-    if (args.notes or args.vel) and not wav_files:
-        print('[ddsp generate] ERROR: zadne soubory neodpovidaji filtru notes/vel')
-        sys.exit(1)
+    if not npz_mode:
+        if note_set:
+            wav_files = [f for f in wav_files if (parse_filename(f) or [60])[0] in note_set]
+        if vel_set:
+            wav_files = [f for f in wav_files if (parse_filename(f) or [0, None])[1] in vel_set]
+        if (note_set or vel_set) and not wav_files:
+            print('[ddsp generate] ERROR: zadne soubory neodpovidaji filtru notes/vel')
+            sys.exit(1)
+    else:
+        if note_set:
+            npz_files = [f for f in npz_files if (parse_filename(f) or [60])[0] in note_set]
+        if vel_set:
+            npz_files = [f for f in npz_files if (parse_filename(f) or [0, None])[1] in vel_set]
+        if (note_set or vel_set) and not npz_files:
+            print('[ddsp generate] ERROR: zadne NPZ soubory neodpovidaji filtru notes/vel')
+            sys.exit(1)
 
     ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
     output_dir = args.output or ithaca_out
@@ -919,28 +938,38 @@ def cmd_generate(args):
         return
 
     # ------------------------------------------------------------------ #
-    # Standard mode: one output per source WAV                            #
+    # Standard mode: one output per source WAV  (or NPZ if WAVs missing) #
     # ------------------------------------------------------------------ #
-    wet   = float(np.clip(args.wet, 0.0, 1.0))
-    total = len(wav_files)
-    print(f'[ddsp generate]  {total} sample(s)  wet={wet:.2f}  output->{output_dir}\n')
+    wet      = float(np.clip(args.wet, 0.0, 1.0))
+    sr_kHz   = SR // 1000
+    src_list = npz_files if npz_mode else wav_files
+    total    = len(src_list)
+    print(f'[ddsp generate]  {total} sample(s)  wet={wet:.2f}  '
+          f'source={"NPZ" if npz_mode else "WAV"}  output->{output_dir}\n')
 
     done = 0
-    for idx, wav_path in enumerate(wav_files):
-        out_name = os.path.basename(wav_path)
-        out_path = os.path.join(output_dir, out_name)
+    for idx, src_path in enumerate(src_list):
+        parsed    = parse_filename(src_path)
+        midi      = parsed[0] if parsed else 60
+        vel_layer = parsed[1] if parsed else 0
+        out_name  = f'm{midi:03d}-vel{vel_layer}-f{sr_kHz}.wav'
+        out_path  = os.path.join(output_dir, out_name)
         if skip and os.path.exists(out_path):
             print(f'  [skip] {out_name}')
             continue
-        parsed    = parse_filename(wav_path)
-        midi      = parsed[0] if parsed else 60
-        vel_layer = parsed[1] if parsed else 0
         try:
-            ref      = load_wav_stereo(wav_path, target_sr=SR)
-            T        = ref.shape[-1]
-            n_frames = math.ceil(T / FRAME_HOP)
-            loudness = extract_loudness_from_audio(ref, n_frames)
-            audio    = synthesize(model, midi, vel_layer, loudness, device, inh_scale=inh_scale)
+            if npz_mode:
+                npz      = np.load(src_path)
+                ref      = npz['audio']                        # (2, T) original audio
+                T        = ref.shape[-1]
+                loudness = npz.get('loudness_L', None)
+                if loudness is None:
+                    loudness = extract_loudness_from_audio(ref, math.ceil(T / FRAME_HOP))
+            else:
+                ref      = load_wav_stereo(src_path, target_sr=SR)
+                T        = ref.shape[-1]
+                loudness = extract_loudness_from_audio(ref, math.ceil(T / FRAME_HOP))
+            audio = synthesize(model, midi, vel_layer, loudness, device, inh_scale=inh_scale)
             if audio.shape[-1] > T:
                 audio = audio[:, :T]
             elif audio.shape[-1] < T:
