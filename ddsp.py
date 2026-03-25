@@ -361,7 +361,7 @@ def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
     lo_db   : (B, F) loudness in dB per frame
     returns : (B, 1, n_samples) weight tensor, floor=1.0, peak=1+alpha
     """
-    B, F = lo_db.shape
+    B, n_frames = lo_db.shape
     # Gaussian smooth along time
     radius = int(4 * sigma + 0.5)
     k = torch.arange(-radius, radius + 1, dtype=lo_db.dtype, device=lo_db.device)
