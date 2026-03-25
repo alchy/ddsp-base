@@ -820,38 +820,17 @@ def cmd_generate(args):
     attack_ramp_ms = getattr(args, 'attack_ramp_ms', 10)
     inh_scale      = float(getattr(args, 'inh_scale', 1.0))
 
-    # Source list: NPZ cache — pure model generation, no WAV reference needed
-    all_npz  = sorted(glob.glob(os.path.join(ws.extracts_dir, '*.npz')))
-    chunk0   = [f for f in all_npz if '_chunk000' in os.path.basename(f)]
-    src_list = chunk0 if chunk0 else all_npz
-    if not src_list:
-        print(f'[ddsp generate] ERROR: zadne NPZ soubory v {ws.extracts_dir} — spust extract')
-        sys.exit(1)
+    wet    = float(np.clip(getattr(args, 'wet', 1.0), 0.0, 1.0))
+    n_vel  = args.vel_layers
+    sr_kHz = SR // 1000
 
-    # Filters
-    note_set, vel_set = None, None
-    if args.notes:
-        note_set = set()
-        for n in args.notes:
-            m = parse_note_name(n)
-            if m is None:
-                print(f'[ddsp generate] ERROR: unknown note "{n}"'); sys.exit(1)
-            note_set.add(m)
-        available = {(parse_filename(f) or [60])[0] for f in src_list}
-        missing   = [n for n, m in zip(args.notes, [parse_note_name(x) for x in args.notes])
-                     if m not in available]
-        if missing:
-            print(f'[ddsp generate] WARNING: tyto noty nejsou v datasetu: {" ".join(missing)}'
-                  f'  (pouzij full-range mod pro syntezu libovolne noty)')
-    if args.vel:
-        vel_set = set(int(v) for v in args.vel)
-    if note_set:
-        src_list = [f for f in src_list if (parse_filename(f) or [60])[0] in note_set]
-    if vel_set:
-        src_list = [f for f in src_list if (parse_filename(f) or [0, None])[1] in vel_set]
-    if (note_set or vel_set) and not src_list:
-        print('[ddsp generate] ERROR: zadne soubory neodpovidaji filtru notes/vel')
-        sys.exit(1)
+    # WAV lookup for wet mix (only needed when wet < 1.0)
+    wav_lookup: dict = {}
+    if wet < 1.0:
+        for f in scan_instrument_dir(ws.source_dir):
+            parsed = parse_filename(f)
+            if parsed:
+                wav_lookup[parsed] = f
 
     ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
     output_dir = args.output or ithaca_out
@@ -930,44 +909,74 @@ def cmd_generate(args):
         return
 
     # ------------------------------------------------------------------ #
-    # Standard mode: pure model generation — one output per NPZ source  #
-    # Envelope: EnvelopeNet (preferred) or NPZ loudness_L (fallback)    #
+    # Note-list mode: user specifies which notes to generate             #
+    # wet=1.0  → pure model (EnvelopeNet or NPZ templates), always OK   #
+    # wet<1.0  → mix with source WAV; no WAV = warning + skip           #
     # ------------------------------------------------------------------ #
-    sr_kHz = SR // 1000
-    total  = len(src_list)
-    env_src_label = (f'EnvelopeNet (n_env={env_model.n_env}  warp={env_model._warp})'
-                     if env_model is not None else 'NPZ loudness_L')
-    print(f'[ddsp generate]  {total} sample(s)  envelopes={env_src_label}  output->{output_dir}\n')
+    if not args.notes:
+        print('[ddsp generate] ERROR: zadejte seznam not (napr. --notes C3 A4 C5) '
+              'nebo pouzijte --full-range pro kompletni rozsah')
+        sys.exit(1)
+
+    note_list = []
+    for n in args.notes:
+        m = parse_note_name(n)
+        if m is None:
+            print(f'[ddsp generate] ERROR: neznama nota "{n}"'); sys.exit(1)
+        note_list.append(m)
+
+    if env_model is not None:
+        env_source = f'EnvelopeNet (n_env={env_model.n_env}  warp={env_model._warp})'
+        templates  = None
+    else:
+        env_source = 'NPZ cache (nearest-neighbour)'
+        templates  = load_envelope_templates(ws.extracts_dir)
+        if not templates:
+            print('[ddsp generate] ERROR: chybi NPZ extrakce i envelope.pt — spust extract a learn-envelope')
+            sys.exit(1)
+
+    total = len(note_list) * n_vel
+    print(f'[ddsp generate]  {len(note_list)} not × {n_vel} vel = {total} samples'
+          f'  wet={wet:.2f}  envelopes={env_source}')
+    print(f'                 output->{output_dir}\n')
 
     done = 0
-    for idx, src_path in enumerate(src_list):
-        parsed    = parse_filename(src_path)
-        midi      = parsed[0] if parsed else 60
-        vel_layer = parsed[1] if parsed else 0
-        out_name  = f'm{midi:03d}-vel{vel_layer}-f{sr_kHz}.wav'
-        out_path  = os.path.join(output_dir, out_name)
-        if skip and os.path.exists(out_path):
-            print(f'  [skip] {out_name}')
-            continue
-        try:
-            if env_model is not None:
-                loudness = env_model.predict_envelope(midi, vel_layer, warp=env_model._warp)
-            else:
-                loudness = np.load(src_path)['loudness_L']
-            T     = len(loudness) * FRAME_HOP
-            audio = synthesize(model, midi, vel_layer, loudness, device, inh_scale=inh_scale)
-            audio = apply_attack_ramp(audio, attack_ramp_ms)
-            save_wav(out_path, audio, SR)
-            done += 1
-            note_name = midi_to_name(midi)
-            freq      = 440.0 * (2.0 ** ((midi - 69) / 12.0))
-            print(f'  [{idx+1:4d}/{total}] {note_name:4s} m{midi:03d} vel{vel_layer}  '
-                  f'{freq:.1f}Hz  {T/SR:.2f}s  -> {out_name}')
-        except Exception as exc:
-            print(f'  ERROR {out_name}: {exc}')
-    print(f'\n[ddsp generate]  done: {done}/{total}')
+    for midi in note_list:
+        freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
+        for vel in range(n_vel):
+            out_name = f'm{midi:03d}-vel{vel}-f{sr_kHz}.wav'
+            out_path = os.path.join(output_dir, out_name)
+            if skip and os.path.exists(out_path):
+                print(f'  [skip] {out_name}')
+                continue
+            if wet < 1.0 and (midi, vel) not in wav_lookup:
+                print(f'  [WARNING] {midi_to_name(midi)} vel{vel}: zdrojovy WAV chybi '
+                      f'pro wet={wet:.2f} — preskakuji')
+                continue
+            try:
+                if env_model is not None:
+                    loudness = env_model.predict_envelope(midi, vel, warp=env_model._warp)
+                else:
+                    loudness = find_envelope(templates, midi, vel)
+                dur_s = len(loudness) * FRAME_HOP / SR
+                audio = synthesize(model, midi, float(vel), loudness, device, inh_scale=inh_scale)
+                if wet < 1.0:
+                    ref = load_wav_stereo(wav_lookup[(midi, vel)], target_sr=SR)
+                    T   = ref.shape[-1]
+                    if audio.shape[-1] > T:   audio = audio[:, :T]
+                    elif audio.shape[-1] < T: audio = np.pad(audio, ((0,0),(0, T-audio.shape[-1])))
+                    audio = wet * audio + (1.0 - wet) * ref
+                audio = apply_attack_ramp(audio, attack_ramp_ms)
+                save_wav(out_path, audio, SR)
+                done += 1
+                print(f'  {midi_to_name(midi):4s} m{midi:03d} vel{vel}  '
+                      f'{freq:.1f}Hz  {dur_s:.1f}s  -> {out_name}')
+            except Exception as exc:
+                print(f'  ERROR {midi_to_name(midi)} vel{vel}: {exc}')
 
-    cfg.update({'generated': {'n_files': done,
+    print(f'\n[ddsp generate]  done: {done}/{total}')
+    cfg.update({'generated': {'n_files': done, 'mode': 'note_list',
+                               'notes': args.notes, 'vel_layers': n_vel,
                                'output_dir': output_dir, 'generated_at': _now()}})
     save_config(ws, cfg)
 

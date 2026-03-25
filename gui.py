@@ -436,14 +436,14 @@ def build_ui():
                 with gr.Row():
                     midi_lo_sl  = gr.Slider(0, 127, value=21, step=1,
                                              label='MIDI lo (jen full-range)',
-                                             info='21 = A0 (nejnizsi nota piána)')
+                                             info='21 = A0 (nejnizsi nota klaviru)')
                     midi_hi_sl  = gr.Slider(0, 127, value=108, step=1,
                                              label='MIDI hi (jen full-range)',
-                                             info='108 = C8 (nejvyssi nota piána)')
+                                             info='108 = C8 (nejvyssi nota klaviru)')
                     vel_layers_sl = gr.Slider(1, 8, value=8, step=1,
-                                              label='Velocity vrstvy (jen full-range)',
-                                              info='Pocet velocity vrstev: 1 = pouze vel 0, '
-                                                   '8 = vel 0-7')
+                                              label='Velocity vrstvy',
+                                              info='Pocet velocity vrstev pro kazdou notu: '
+                                                   '1 = pouze vel 0, 8 = vel 0-7')
                 with gr.Row():
                     env_source_radio = gr.Radio(
                         choices=['auto', 'envelopenet', 'npz'],
@@ -456,23 +456,20 @@ def build_ui():
                     attack_ramp_sl = gr.Slider(0, 50, value=10, step=1,
                                                label='Attack ramp (ms)',
                                                info='Raised-cosine nabehu na zacatku tonu. '
-                                                    '0 = vypnuto. 10 ms = prirozeny uder kladivka. '
-                                                    'Platí pro oba mody (standard i full-range).')
+                                                    '0 = vypnuto. 10 ms = prirozeny uder kladivka.')
                 with gr.Row():
-                    wet_sl   = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
-                                          label='Wet (jen standardni mod)',
-                                          info='1.0 = plny DDSP vystup, 0.0 = original WAV, '
-                                               '0.5 = mix. Jen pro standardni mod.')
+                    wet_sl = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
+                                       label='Wet (jen note-list mod)',
+                                       info='1.0 = cisty model. < 1.0 = mix s originalem '
+                                            '(vyzaduje zdrojove WAV; bez nich preskoci danou notu).')
                     inh_scale_sl = gr.Slider(0.0, 2.0, value=1.0, step=0.1,
                                              label='Inharmonicity scale',
                                              info='0.0 = ciste harmonicke, 1.0 = naucene B, '
-                                                  '2.0 = zesilenа inharmonicita. Plati pro oba mody.')
-                    notes_in = gr.Textbox(label='Noty (prazdne = vse, jen standardni mod)',
-                                           placeholder='C4 A3 G3',
-                                           info='Generovat jen tyto noty. Prazdne = vsechny.')
-                    vel_in   = gr.Textbox(label='Velocity (prazdne = vse, jen standardni mod)',
-                                           placeholder='5 7',
-                                           info='Generovat jen tyto velocity vrstvy.')
+                                                  '2.0 = zesilenа inharmonicita.')
+                    notes_in = gr.Textbox(label='Noty (note-list mod, prazdne = chyba)',
+                                           placeholder='C3 A3 C4 A4 C5',
+                                           info='Seznam not k vygenerovani. Pouziva se kdyz '
+                                                'full-range neni zaskrtnuto.')
                 output_in = gr.Textbox(
                     label='Vystupni adresar (prazdne = IthacaPlayer/<nastroj>/)',
                     placeholder='',
@@ -487,24 +484,23 @@ def build_ui():
 
                 def run_generate(instrument, workspace, full_range, midi_lo, midi_hi,
                                  vel_layers, env_src, atk_ramp, wet, inh_scale,
-                                 notes, vel, output, no_skip_val, device):
+                                 notes, output, no_skip_val, device):
                     if not instrument:
                         return 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
                     args = ['generate', '--instrument', instrument,
                             '--envelope-source', env_src,
                             '--attack-ramp-ms', str(int(atk_ramp)),
                             '--inharmonicity-scale', f'{inh_scale:.2f}',
+                            '--vel-layers', str(int(vel_layers)),
                             '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
                     if full_range:
                         args += ['--full-range',
                                  '--midi-lo', str(int(midi_lo)),
-                                 '--midi-hi', str(int(midi_hi)),
-                                 '--vel-layers', str(int(vel_layers))]
+                                 '--midi-hi', str(int(midi_hi))]
                     else:
                         args += ['--wet', f'{wet:.2f}']
                         if notes.strip(): args += ['--notes'] + notes.split()
-                        if vel.strip():   args += ['--vel']   + vel.split()
                     if (output or '').strip(): args += ['--output', output.strip()]
                     if no_skip_val:      args.append('--no-skip')
                     return run_command(args, gen_log)
@@ -513,7 +509,7 @@ def build_ui():
                                inputs=[instrument_in, workspace_in, full_range_chk,
                                        midi_lo_sl, midi_hi_sl, vel_layers_sl,
                                        env_source_radio, attack_ramp_sl,
-                                       wet_sl, inh_scale_sl, notes_in, vel_in,
+                                       wet_sl, inh_scale_sl, notes_in,
                                        output_in, no_skip, device_dd],
                                outputs=gen_log)
                 gen_stop.click(fn=stop_command, outputs=gen_log)
