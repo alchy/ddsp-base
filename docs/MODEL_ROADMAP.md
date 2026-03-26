@@ -91,6 +91,64 @@ zatímco transpozice vyšších not do basu zní čistěji — potvrzeno poslech
 
 ---
 
+### [dev-adaptive-nharm] Adaptivní počet harmonických — konec "muddy/LPF" basů
+
+**Problém**: `N_HARM = 32` nastavoval pevný strop pro všechny noty. Výsledkem bylo,
+že harmonický synth pokrýval jen zlomek slyšitelného spektra basových not:
+
+| Nota | f0 | N_HARM=32 pokryto do | Zbytek spektra |
+|------|----|----------------------|----------------|
+| A0   | 27.5 Hz | **880 Hz**    | 23 kHz = jen noise |
+| A1   | 55 Hz   | **1 760 Hz**  | 22 kHz = jen noise |
+| A2   | 110 Hz  | **3 520 Hz**  | 20 kHz = jen noise |
+| A4   | 440 Hz  | 14 080 Hz     | OK |
+
+Noise synth nad mezní frekvencí generuje filtrovaný šum bez harmonické struktury →
+basy znějí jako klavír za LPF filtrem, "muddy", bez "znělosti" v horním pásmu.
+
+**Řešení**: `N_HARM_MAX = 128`, počet aktivních harmonických adaptivní per batch item:
+
+```python
+# HarmonicSynth.forward
+f0_mean  = f0_up.mean(dim=-1)                                   # (B,)
+n_active = ((k.unsqueeze(0) * f0_mean.unsqueeze(1)) < SR * 0.45) \
+           .sum(dim=1).clamp(min=1).float()                     # (B,)
+...
+return signal / n_active.view(B, 1, 1)   # normalizace n_active, ne pevným N
+```
+
+Normalizace opravena z pevného `/N` na `/n_active` — hlasitost konzistentní bez ohledu
+na počet aktivních harmonických.
+
+**Výsledek po zvýšení N_HARM_MAX=32 → 128**:
+
+| Nota | f0 | n_active | Pokryto do | Zlepšení |
+|------|----|----------|-----------|----------|
+| A0   | 27.5 Hz | 128 | **3 520 Hz** | +4× |
+| A1   | 55 Hz   | 128 | **7 040 Hz** | +4× |
+| A2   | 110 Hz  | 109 | **11 925 Hz** | skoro plné |
+| A3   | 220 Hz  |  54 | plné (nyq.)  | = |
+| A4+  | ≥440 Hz |  ≤54| plné (nyq.)  | beze změny |
+
+Treble noty nejsou dotčeny — nyquist maska přirozeně omezí n_active.
+
+**Možné zvýšení pokud A0–A1 stále problematické po poslechu**:
+
+| N_HARM_MAX | A0 pokryto | Paměť tensoru (B=16, crop=200 fr) |
+|-----------|------------|-----------------------------------|
+| 128        | 3 520 Hz  | ~196 MB — **aktuální** |
+| 256        | 7 040 Hz  | ~393 MB — doporučený next step |
+| 512        | 14 080 Hz | ~786 MB — hranice CPU RAM |
+| 872 (full) | 24 000 Hz | ~1.3 GB — pouze GPU |
+
+Zvýšení na **256 je přirozený next step** po poslechu výsledků s 128.
+Provést změnou jediné konstanty: `N_HARM_MAX = 256` v `model_ddsp.py` + re-trénink.
+
+**Kombinace s [dev-noise-fft]**: harmonic-relative noise warping zajistí, že noise synth
+pokrývá zbytek spektra nad `N_HARM_MAX × f0` ve správném harmonickém kontextu.
+
+---
+
 ## Roadmap
 
 Pořadí reflektuje poměr přínos/náklady při **aktuálním hardwaru (CPU notebook)**.
