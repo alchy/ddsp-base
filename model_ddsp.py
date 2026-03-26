@@ -14,6 +14,8 @@ where d_k  (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
       inh  (inharmonicity coeff)    = sigmoid(head_B).mean(T) × B_MAX(f0)
            B_MAX(f0) = 0.0008 · exp(-(midi(f0) − 21) / 88 · ln10)
            pools over time → single scalar per note, physically correct
+      n_active (adaptive harmonic count) = min(N_HARM_MAX, floor(nyquist / f0))
+           bass notes use more harmonics than treble notes automatically
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -25,7 +27,8 @@ import torch.nn.functional as F
 
 SR        = 48000
 FRAME_HOP = 240           # 5 ms per frame @ 48 kHz
-N_HARM    = 32            # harmonic oscillators
+N_HARM_MAX = 128          # max harmonic oscillators; active count = min(N_HARM_MAX, floor(nyquist/f0))
+N_HARM     = N_HARM_MAX   # alias used throughout (head sizes, normalization)
 NOISE_FFT = 1024
 N_NOISE   = NOISE_FFT // 2 + 1   # = 513 spectral bins
 
@@ -94,11 +97,12 @@ def encode_loudness(loudness_db: torch.Tensor, dim: int = LO_DIM) -> torch.Tenso
 
 class HarmonicSynth(nn.Module):
     """
-    Additive synthesis: weighted sum of N_HARM sinusoids at k * F0(t).
+    Additive synthesis: weighted sum of up to N_HARM_MAX sinusoids at k * F0(t).
 
-    Output is amplitude-normalized by 1/N_HARM so that the mean harmonic
-    produces unit amplitude regardless of how many harmonics are active.
-    Loudness is applied externally as a post-multiplier in DDSPVocoder.
+    The number of active harmonics is adaptive per batch item:
+        n_active = min(N_HARM_MAX, floor(nyquist / f0))
+    so bass notes automatically use more harmonics than treble notes.
+    Signal is normalized by n_active so output level is consistent.
 
     Output: (B, 1, n_samples)
     """
@@ -125,11 +129,18 @@ class HarmonicSynth(nn.Module):
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
+        # Adaptive normalization: divide by n_active harmonics per batch item,
+        # not by fixed N — bass notes use more harmonics than treble notes.
+        # n_active = number of harmonics with k·f0 < nyquist (using mean f0)
+        f0_mean  = f0_up.mean(dim=-1)                                      # (B,)
+        n_active = ((k.unsqueeze(0) * f0_mean.unsqueeze(1)) < SR * 0.45) \
+                   .sum(dim=1).clamp(min=1).float()                        # (B,)
+
         # Phase accumulation: cumsum over instantaneous frequency
         phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
-        return signal / N   # normalize: mean harmonic → unit amplitude
+        return signal / n_active.view(B, 1, 1)
 
 
 # ---------------------------------------------------------------------------
