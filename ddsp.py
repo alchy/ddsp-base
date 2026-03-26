@@ -860,7 +860,7 @@ def cmd_generate(args):
             if parsed:
                 wav_lookup[parsed] = f
 
-    ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
+    ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, 'generated', ws.name)
     output_dir = args.output or ithaca_out
     output_dir = output_dir if os.path.isabs(output_dir) else os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)

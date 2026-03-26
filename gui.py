@@ -70,17 +70,21 @@ def _read_status(instrument_dir: str, workspace_dir: str = '') -> str:
     npz_count  = len(glob.glob(os.path.join(work_dir, 'extracts', '*.npz')))
     has_ckpt   = os.path.exists(os.path.join(work_dir, 'checkpoints', 'best.pt'))
     has_env    = os.path.exists(os.path.join(work_dir, 'checkpoints', 'envelope.pt'))
-    ithaca_dir = os.path.join(ITHACA_ROOT, name)
+    ithaca_dir = os.path.join(ITHACA_ROOT, 'generated', name)
     gen_count  = len(glob.glob(os.path.join(ithaca_dir, '*.wav')))
     ext_info   = cfg.get('extract', {})
     trn_info   = cfg.get('training', {})
     gen_info   = cfg.get('generated', {})
 
+    extracts_dir   = os.path.join(work_dir, 'extracts')
+    checkpoints_dir = os.path.join(work_dir, 'checkpoints')
     lines = [
-        f'Nastroj:   {cfg.get("instrument", "?")}',
-        f'Zdroj:     {instrument_dir}',
-        f'Workspace: {work_dir}',
-        f'Vystup:    {ithaca_dir}',
+        f'Nastroj:     {cfg.get("instrument", "?")}',
+        f'Zdroj:       {instrument_dir}',
+        f'Workspace:   {work_dir}',
+        f'Extrakce:    {extracts_dir}',
+        f'Checkpointy: {checkpoints_dir}',
+        f'Vystup:      {ithaca_dir}',
         '',
         f'[{tick(npz_count)}] Extrakce    {npz_count} NPZ souboru' +
             (f'  [{ext_info.get("completed_at","")}]' if ext_info else ''),
@@ -419,7 +423,7 @@ def build_ui():
             with gr.Tab('Generovani'):
                 gr.Markdown(
                     'Generuje WAV vzorky pomoci natrenovaneho modelu.\n'
-                    'Vystup: `C:\\SoundBanks\\IthacaPlayer\\<nastroj>\\`'
+                    'Vystup: `C:\\SoundBanks\\IthacaPlayer\\generated\\<nastroj>\\`'
                 )
                 gen_status_out   = gr.Textbox(label='Stav generovani', lines=2,
                                               interactive=False, max_lines=2)
@@ -429,7 +433,7 @@ def build_ui():
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
                     name      = os.path.basename(instrument.rstrip('/\\'))
-                    out_dir   = (output or '').strip() or os.path.join(ITHACA_ROOT, name)
+                    out_dir   = (output or '').strip() or os.path.join(ITHACA_ROOT, 'generated', name)
                     wav_files = glob.glob(os.path.join(out_dir, '*.wav'))
                     n_wav     = len(wav_files)
                     if n_wav == 0:
@@ -489,9 +493,9 @@ def build_ui():
                                            info='Seznam not k vygenerovani. Pouziva se kdyz '
                                                 'full-range neni zaskrtnuto.')
                 output_in = gr.Textbox(
-                    label='Vystupni adresar (prazdne = IthacaPlayer/<nastroj>/)',
+                    label='Vystupni adresar (prazdne = IthacaPlayer/generated/<nastroj>/)',
                     placeholder='',
-                    info=f'Vychozi: {ITHACA_ROOT}\\<nastroj>\\  '
+                    info=f'Vychozi: {ITHACA_ROOT}\\generated\\<nastroj>\\  '
                          r'Muze byt relativni i absolutni cesta.'
                 )
                 gen_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
