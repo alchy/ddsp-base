@@ -89,6 +89,50 @@ zatímco transpozice vyšších not do basu zní čistěji — potvrzeno poslech
 - `fft_sizes=(256, 1024, 4096, 16384)` → 16384 dá 2.9 Hz/bin
 - A0 (27.5 Hz) leží v binu 9 místo binu 0 → loss konečně vidí basové harmonické
 
+**D — Harmonic-relative noise warping** (model_ddsp.py):
+
+**Problém**: `NoiseSynth` generoval spektrální tvar v **absolutních Hz binech**
+(bin 0 = 0 Hz, bin 1 = 46.9 Hz, …). Model se musel naučit úplně jiné hodnoty
+pro každou výšku noty — peak šumu na 523 Hz pro C4 se při transpozici na C5
+nepřesune na 1046 Hz automaticky. Noise spektrum nesledovalo f0.
+
+Důsledek: noise přidával energii na pevných absolutních frekvencích, které
+nesedí na harmonické jiné noty → vnímaný pitch detunovaný, "posunutý" zvuk.
+
+**Řešení**: `NoiseSynth.forward()` přijímá `f0_hz` a warpuje spektrální tvar
+z harmonic-relative prostoru na absolutní STFT biny:
+
+```
+Noise bin k  →  absolutní freq  =  k · f0 · N_HARM / N
+STFT bin i   →  absolutní freq  =  i · SR / n_fft
+
+Pro STFT bin i:  zdrojový noise bin  =  i · (SR/n_fft) / f0 · N / N_HARM
+```
+
+Model se učí spektrální tvar **vždy relativně k f0** — "peak mezi 2. a 3.
+harmonikem" se automaticky škáluje pro libovolnou výšku noty.
+
+```python
+# NoiseSynth.forward (zjednodušeno)
+f0_mean    = f0_hz.clamp(min=F0_MIN).mean(dim=1)              # (B,)
+stft_freqs = torch.arange(n_bins) * (SR / n_fft)             # (n_bins,)
+src_pos    = stft_freqs / f0_mean * (N / N_HARM)             # (B, n_bins)
+src_pos    = src_pos.clamp(0, N - 1)
+# bilineární interpolace mag_up na pozicích src_pos → mag_abs
+out = istft(stft * mag_abs, ...)
+```
+
+**Pokrytí noise binů** (N=513, N_HARM=128 po dev-adaptive-nharm):
+
+| Nota | f0 | Noise bins pokrývají do |
+|------|----|------------------------|
+| A0   | 27.5 Hz | 3 520 Hz (= N_HARM × f0) → zbytek flat |
+| A2   | 110 Hz  | 14 080 Hz |
+| A4   | 440 Hz  | Nyquist |
+
+Biny nad `N_HARM × f0` jsou clamped na poslední bin → šum je tam konstantní,
+ale harmonická struktura je zachycena správně v pokrytém pásmu.
+
 ---
 
 ### [dev-adaptive-nharm] Adaptivní počet harmonických — konec "muddy/LPF" basů
