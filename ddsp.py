@@ -600,6 +600,11 @@ def cmd_learn(args):
         start_epoch = ckpt['epoch'] + 1
         best_val    = ckpt.get('best_val', float('inf'))
         print(f'[ddsp learn]  resumed from epoch {start_epoch}  best_val={best_val:.4f}')
+    else:
+        for pt in (last_pt, best_pt):
+            if os.path.exists(pt):
+                os.remove(pt)
+                print(f'[ddsp learn]  removed old checkpoint: {os.path.basename(pt)}')
 
     # Training log
     log_f = open(ws.log_path, 'a', buffering=1)
