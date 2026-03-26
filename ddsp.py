@@ -531,7 +531,16 @@ def cmd_learn(args):
     ws.makedirs()
 
     cfg = load_config(ws)
-    model_size = args.model or cfg.get('model_size', 'small')
+    saved_size = cfg.get('model_size')
+    if saved_size:
+        # instrument.json is authoritative — ignore --model to prevent size mismatch
+        if args.model and args.model != saved_size:
+            print(f'[ddsp learn]  WARNING: --model {args.model} ignored; '
+                  f'instrument.json specifies model_size={saved_size}. '
+                  f'Delete the workspace to start fresh with a different size.')
+        model_size = saved_size
+    else:
+        model_size = args.model or 'small'
     if model_size not in MODEL_SIZES:
         print(f'[ddsp learn] ERROR: unknown model size "{model_size}". '
               f'Choose from: {list(MODEL_SIZES)}')
@@ -656,7 +665,7 @@ def cmd_learn(args):
         best_tag = ''
         if vl < best_val:
             best_val = vl
-            torch.save(model.state_dict(), best_pt)
+            torch.save({'model': model.state_dict(), 'model_size': model_size}, best_pt)
             best_tag = '  <- best'
 
         line = (f'ep {epoch:4d}  train={tl:.4f}  val={vl:.4f}  '
@@ -820,16 +829,27 @@ def cmd_generate(args):
     ws = make_workspace(args.instrument, getattr(args, "workspace", None))
 
     cfg       = load_config(ws)
-    model_size = cfg.get('model_size', 'small')
     best_pt   = os.path.join(ws.checkpoints_dir, 'best.pt')
     if not os.path.exists(best_pt):
         print(f'[ddsp generate] ERROR: no checkpoint at {best_pt}')
         print('[ddsp generate] Run: python ddsp.py learn --instrument <path>')
         sys.exit(1)
 
-    device = resolve_device(getattr(args, 'device', 'auto'))
+    device  = resolve_device(getattr(args, 'device', 'auto'))
+    raw     = torch.load(best_pt, map_location=device, weights_only=True)
+    if isinstance(raw, dict) and 'model' in raw:
+        state_dict = raw['model']
+        model_size = raw.get('model_size') or cfg.get('model_size')
+    else:
+        # backward compat: plain state_dict saved by older versions
+        state_dict = raw
+        model_size = cfg.get('model_size')
+    if not model_size:
+        print('[ddsp generate] ERROR: model_size not found in checkpoint or instrument.json. '
+              'Re-run learn to rebuild the checkpoint.')
+        sys.exit(1)
     model  = build_ddsp(size=model_size).to(device)
-    model.load_state_dict(torch.load(best_pt, map_location=device, weights_only=True))
+    model.load_state_dict(state_dict)
     model.eval()
     print(f'[ddsp generate]  instrument={ws.name}  model={model_size}  device={device}')
     print(f'                 checkpoint -> {best_pt}')
