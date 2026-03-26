@@ -14,6 +14,8 @@ where d_k  (harmonic distribution) = softmax(head_harm),  sum_k d_k = 1
       inh  (inharmonicity coeff)    = sigmoid(head_B).mean(T) × B_MAX(f0)
            B_MAX(f0) = 0.0008 · exp(-(midi(f0) − 21) / 88 · ln10)
            pools over time → single scalar per note, physically correct
+      n_active (adaptive harmonic count) = min(N_HARM_MAX, floor(nyquist / f0))
+           bass notes use more harmonics than treble notes automatically
 
 Conditioned on (F0, loudness, velocity) per 5 ms frame.
 """
@@ -25,9 +27,10 @@ import torch.nn.functional as F
 
 SR        = 48000
 FRAME_HOP = 240           # 5 ms per frame @ 48 kHz
-N_HARM    = 32            # harmonic oscillators
-NOISE_FFT = 256
-N_NOISE   = NOISE_FFT // 2 + 1   # = 129 spectral bins
+N_HARM_MAX = 128          # max harmonic oscillators; active count = min(N_HARM_MAX, floor(nyquist/f0))
+N_HARM     = N_HARM_MAX   # alias used throughout (head sizes, normalization)
+NOISE_FFT = 1024
+N_NOISE   = NOISE_FFT // 2 + 1   # = 513 spectral bins
 
 F0_MIN  = 20.0
 F0_MAX  = 5000.0
@@ -94,11 +97,12 @@ def encode_loudness(loudness_db: torch.Tensor, dim: int = LO_DIM) -> torch.Tenso
 
 class HarmonicSynth(nn.Module):
     """
-    Additive synthesis: weighted sum of N_HARM sinusoids at k * F0(t).
+    Additive synthesis: weighted sum of up to N_HARM_MAX sinusoids at k * F0(t).
 
-    Output is amplitude-normalized by 1/N_HARM so that the mean harmonic
-    produces unit amplitude regardless of how many harmonics are active.
-    Loudness is applied externally as a post-multiplier in DDSPVocoder.
+    The number of active harmonics is adaptive per batch item:
+        n_active = min(N_HARM_MAX, floor(nyquist / f0))
+    so bass notes automatically use more harmonics than treble notes.
+    Signal is normalized by n_active so output level is consistent.
 
     Output: (B, 1, n_samples)
     """
@@ -125,11 +129,18 @@ class HarmonicSynth(nn.Module):
         nyq_mask = (inst_freq < SR * 0.45).float()
         a = a * nyq_mask
 
+        # Adaptive normalization: divide by n_active harmonics per batch item,
+        # not by fixed N — bass notes use more harmonics than treble notes.
+        # n_active = number of harmonics with k·f0 < nyquist (using mean f0)
+        f0_mean  = f0_up.mean(dim=-1)                                      # (B,)
+        n_active = ((k.unsqueeze(0) * f0_mean.unsqueeze(1)) < SR * 0.45) \
+                   .sum(dim=1).clamp(min=1).float()                        # (B,)
+
         # Phase accumulation: cumsum over instantaneous frequency
         phase = torch.cumsum(2.0 * math.pi * inst_freq / SR, dim=-1)
 
         signal = (a * torch.sin(phase)).sum(dim=1, keepdim=True)
-        return signal / N   # normalize: mean harmonic → unit amplitude
+        return signal / n_active.view(B, 1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -147,20 +158,53 @@ class NoiseSynth(nn.Module):
         self.n_fft = n_fft
         self.hop   = n_fft // 4
 
-    def forward(self, noise_mags, n_samples):
+    def forward(self, noise_mags, f0_hz, n_samples):
+        """
+        noise_mags : (B, T_frames, N)  spectral shape in harmonic-relative space
+                     bin k → absolute freq  k · f0 · N_HARM / N
+                     keeps the same spectral shape relative to f0 across all pitches
+        f0_hz      : (B, T)            fundamental frequency (Hz); mean used for warping
+        n_samples  : int
+        """
         B, T_frames, N = noise_mags.shape
         device = noise_mags.device
         n_fft, hop = self.n_fft, self.hop
+        n_bins = n_fft // 2 + 1
 
         window = torch.hann_window(n_fft, device=device)
         noise  = torch.randn(B, n_samples, device=device)
         stft   = torch.stft(noise, n_fft=n_fft, hop_length=hop, win_length=n_fft,
                              window=window, return_complex=True)
         T_stft = stft.shape[-1]
-        mag    = F.interpolate(noise_mags.permute(0, 2, 1), size=T_stft,
-                                mode='linear', align_corners=False)
-        out    = torch.istft(stft * mag, n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                              window=window, length=n_samples)
+
+        # Upsample noise_mags from model frame rate to STFT frame rate
+        mag_up = F.interpolate(noise_mags.permute(0, 2, 1), size=T_stft,
+                                mode='linear', align_corners=False)   # (B, N, T_stft)
+
+        # Warp harmonic-relative bins → absolute STFT bins
+        # Noise bin k represents freq  k · f0 · N_HARM / N
+        # STFT bin i represents freq   i · SR / n_fft
+        # → for STFT bin i: source noise bin = i · (SR/n_fft) / f0 · N / N_HARM
+        f0_mean    = f0_hz.clamp(min=F0_MIN).mean(dim=1)                        # (B,)
+        stft_freqs = torch.arange(n_bins, dtype=torch.float32, device=device) \
+                     * (SR / n_fft)                                              # (n_bins,)
+        src_pos    = stft_freqs.unsqueeze(0) / f0_mean.unsqueeze(1) \
+                     * (N / N_HARM)                                              # (B, n_bins)
+        src_pos    = src_pos.clamp(0.0, N - 1.0)
+
+        # Linear interpolation: gather at floor/ceil, blend with fractional part
+        idx_lo  = src_pos.long()                                                 # (B, n_bins)
+        idx_hi  = (idx_lo + 1).clamp(max=N - 1)
+        frac    = (src_pos - idx_lo.float()) \
+                  .unsqueeze(-1).expand(-1, -1, T_stft)                          # (B, n_bins, T_stft)
+        idx_lo  = idx_lo.unsqueeze(-1).expand(-1, -1, T_stft)                   # (B, n_bins, T_stft)
+        idx_hi  = idx_hi.unsqueeze(-1).expand(-1, -1, T_stft)
+        val_lo  = torch.gather(mag_up, 1, idx_lo)
+        val_hi  = torch.gather(mag_up, 1, idx_hi)
+        mag_abs = val_lo + frac * (val_hi - val_lo)                              # (B, n_bins, T_stft)
+
+        out = torch.istft(stft * mag_abs, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                           window=window, length=n_samples)
         return out.unsqueeze(1)
 
 
@@ -204,8 +248,11 @@ class DDSPVocoder(nn.Module):
         self.head_harm_R  = nn.Linear(mlp_dim, N_HARM)
         self.head_amp_L   = nn.Linear(mlp_dim, 1)
         self.head_amp_R   = nn.Linear(mlp_dim, 1)
-        self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
-        self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
+        self.head_noise_L     = nn.Linear(mlp_dim, N_NOISE)
+        self.head_noise_R     = nn.Linear(mlp_dim, N_NOISE)
+        # Global noise amplitude scalar — decouples spectral shape from level
+        self.head_noise_amp_L = nn.Linear(mlp_dim, 1)
+        self.head_noise_amp_R = nn.Linear(mlp_dim, 1)
 
         # Piano inharmonicity: single scalar B per note (pooled over T)
         # f_k = k·f0·√(1 + B·k²),  B_MAX is MIDI-dependent (see forward)
@@ -216,8 +263,10 @@ class DDSPVocoder(nn.Module):
         self.harm_synth  = HarmonicSynth()
         self.noise_synth = NoiseSynth()
 
-        nn.init.constant_(self.head_noise_L.bias, -3.0)
-        nn.init.constant_(self.head_noise_R.bias, -3.0)
+        nn.init.constant_(self.head_noise_L.bias,     -3.0)
+        nn.init.constant_(self.head_noise_R.bias,     -3.0)
+        nn.init.constant_(self.head_noise_amp_L.bias, -3.0)
+        nn.init.constant_(self.head_noise_amp_R.bias, -3.0)
 
     def forward(self, f0_hz, loudness_db, velocity=None, n_frames=None, inh_scale=1.0):
         """
@@ -247,8 +296,10 @@ class DDSPVocoder(nn.Module):
         harm_amp_R  = F.softplus(self.head_amp_R(feat))
         harm_amps_L = harm_dist_L * harm_amp_L
         harm_amps_R = harm_dist_R * harm_amp_R
-        noise_L     = torch.sigmoid(self.head_noise_L(feat))
-        noise_R     = torch.sigmoid(self.head_noise_R(feat))
+        noise_L     = torch.sigmoid(self.head_noise_L(feat)) \
+                      * F.softplus(self.head_noise_amp_L(feat))
+        noise_R     = torch.sigmoid(self.head_noise_R(feat)) \
+                      * F.softplus(self.head_noise_amp_R(feat))
 
         # Inharmonicity: MIDI-dependent B_MAX from mean F0, pooled scalar per note
         # B_MAX = 0.0008 · exp(-(midi-21)/88·ln10)  — basy ~0.0008, výšky ~0.00008
@@ -261,8 +312,8 @@ class DDSPVocoder(nn.Module):
         n_samples   = n_frames * FRAME_HOP
         harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh)
         harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh=inh)
-        noise_sig_L = self.noise_synth(noise_L, n_samples)
-        noise_sig_R = self.noise_synth(noise_R, n_samples)
+        noise_sig_L = self.noise_synth(noise_L, f0_hz, n_samples)
+        noise_sig_R = self.noise_synth(noise_R, f0_hz, n_samples)
 
         # Loudness applied as a linear amplitude envelope (post-synthesis)
         # Convert dB → linear, upsample from frame rate to sample rate

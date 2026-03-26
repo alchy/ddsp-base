@@ -379,7 +379,7 @@ def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
     return w_up
 
 
-def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096)):
+def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096, 16384)):
     B, C, T = pred.shape
     p_flat  = pred.reshape(B * C, T)
     t_flat  = target.reshape(B * C, T)
@@ -531,7 +531,16 @@ def cmd_learn(args):
     ws.makedirs()
 
     cfg = load_config(ws)
-    model_size = args.model or cfg.get('model_size', 'small')
+    saved_size = cfg.get('model_size')
+    if saved_size:
+        # instrument.json is authoritative — ignore --model to prevent size mismatch
+        if args.model and args.model != saved_size:
+            print(f'[ddsp learn]  WARNING: --model {args.model} ignored; '
+                  f'instrument.json specifies model_size={saved_size}. '
+                  f'Delete the workspace to start fresh with a different size.')
+        model_size = saved_size
+    else:
+        model_size = args.model or 'small'
     if model_size not in MODEL_SIZES:
         print(f'[ddsp learn] ERROR: unknown model size "{model_size}". '
               f'Choose from: {list(MODEL_SIZES)}')
@@ -591,6 +600,11 @@ def cmd_learn(args):
         start_epoch = ckpt['epoch'] + 1
         best_val    = ckpt.get('best_val', float('inf'))
         print(f'[ddsp learn]  resumed from epoch {start_epoch}  best_val={best_val:.4f}')
+    else:
+        for pt in (last_pt, best_pt):
+            if os.path.exists(pt):
+                os.remove(pt)
+                print(f'[ddsp learn]  removed old checkpoint: {os.path.basename(pt)}')
 
     # Training log
     log_f = open(ws.log_path, 'a', buffering=1)
@@ -656,7 +670,7 @@ def cmd_learn(args):
         best_tag = ''
         if vl < best_val:
             best_val = vl
-            torch.save(model.state_dict(), best_pt)
+            torch.save({'model': model.state_dict(), 'model_size': model_size}, best_pt)
             best_tag = '  <- best'
 
         line = (f'ep {epoch:4d}  train={tl:.4f}  val={vl:.4f}  '
@@ -820,16 +834,27 @@ def cmd_generate(args):
     ws = make_workspace(args.instrument, getattr(args, "workspace", None))
 
     cfg       = load_config(ws)
-    model_size = cfg.get('model_size', 'small')
     best_pt   = os.path.join(ws.checkpoints_dir, 'best.pt')
     if not os.path.exists(best_pt):
         print(f'[ddsp generate] ERROR: no checkpoint at {best_pt}')
         print('[ddsp generate] Run: python ddsp.py learn --instrument <path>')
         sys.exit(1)
 
-    device = resolve_device(getattr(args, 'device', 'auto'))
+    device  = resolve_device(getattr(args, 'device', 'auto'))
+    raw     = torch.load(best_pt, map_location=device, weights_only=True)
+    if isinstance(raw, dict) and 'model' in raw:
+        state_dict = raw['model']
+        model_size = raw.get('model_size') or cfg.get('model_size')
+    else:
+        # backward compat: plain state_dict saved by older versions
+        state_dict = raw
+        model_size = cfg.get('model_size')
+    if not model_size:
+        print('[ddsp generate] ERROR: model_size not found in checkpoint or instrument.json. '
+              'Re-run learn to rebuild the checkpoint.')
+        sys.exit(1)
     model  = build_ddsp(size=model_size).to(device)
-    model.load_state_dict(torch.load(best_pt, map_location=device, weights_only=True))
+    model.load_state_dict(state_dict)
     model.eval()
     print(f'[ddsp generate]  instrument={ws.name}  model={model_size}  device={device}')
     print(f'                 checkpoint -> {best_pt}')
@@ -860,7 +885,7 @@ def cmd_generate(args):
             if parsed:
                 wav_lookup[parsed] = f
 
-    ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, ws.name)
+    ithaca_out = os.path.join(ITHACA_PLAYER_ROOT, 'generated', ws.name)
     output_dir = args.output or ithaca_out
     output_dir = output_dir if os.path.isabs(output_dir) else os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)

@@ -64,6 +64,135 @@ CLI: `--inharmonicity-scale`, GUI: slider „Inharmonicity scale" (0.0–2.0).
 
 ---
 
+## Implementováno (pokračování)
+
+### [dev-noise-fft] NOISE_FFT 256 → 1024 + globální noise amplitude + MRSTFT 16384
+
+**Problém**: `NOISE_FFT = 256` dává rozlišení 187.5 Hz/bin. Pro A0 (27.5 Hz) leží
+celé basové spektrum v prvních 1–2 binech ze 129 → model nemůže naučit tvar šumové
+textury v basech. Výsledek: "filtrovaný/tlumený" zvuk v nízkých rejstřících,
+zatímco transpozice vyšších not do basu zní čistěji — potvrzeno poslechem D4→D2.
+
+**Řešení** (tři změny v jednom branchi):
+
+**B — NOISE_FFT: 256 → 1024** (model_ddsp.py):
+- `N_NOISE = 513` místo 129, rozlišení 46.9 Hz/bin (4× lepší)
+- A0: h1–h6 leží v binech 0–3 místo binu 0; model má prostor naučit texturní tvar
+- Nekompatibilní s předchozími checkpointy (head_noise L/R mají jiný výstup)
+
+**C — noise_amp globální scalar** (model_ddsp.py):
+- `head_noise_amp_L/R: mlp_dim → 1` (softplus), analogie s `head_amp_L/R` u harmonických
+- Oddělen tvar spektra (sigmoid, 513 binů) od celkové hlasitosti šumu (softplus, 1 hodnota)
+- Init bias = -3.0 → tiché na začátku, model se naučí zvyšovat dle potřeby
+
+**A — MRSTFT fft_sizes přidán 16384** (ddsp.py):
+- `fft_sizes=(256, 1024, 4096, 16384)` → 16384 dá 2.9 Hz/bin
+- A0 (27.5 Hz) leží v binu 9 místo binu 0 → loss konečně vidí basové harmonické
+
+**D — Harmonic-relative noise warping** (model_ddsp.py):
+
+**Problém**: `NoiseSynth` generoval spektrální tvar v **absolutních Hz binech**
+(bin 0 = 0 Hz, bin 1 = 46.9 Hz, …). Model se musel naučit úplně jiné hodnoty
+pro každou výšku noty — peak šumu na 523 Hz pro C4 se při transpozici na C5
+nepřesune na 1046 Hz automaticky. Noise spektrum nesledovalo f0.
+
+Důsledek: noise přidával energii na pevných absolutních frekvencích, které
+nesedí na harmonické jiné noty → vnímaný pitch detunovaný, "posunutý" zvuk.
+
+**Řešení**: `NoiseSynth.forward()` přijímá `f0_hz` a warpuje spektrální tvar
+z harmonic-relative prostoru na absolutní STFT biny:
+
+```
+Noise bin k  →  absolutní freq  =  k · f0 · N_HARM / N
+STFT bin i   →  absolutní freq  =  i · SR / n_fft
+
+Pro STFT bin i:  zdrojový noise bin  =  i · (SR/n_fft) / f0 · N / N_HARM
+```
+
+Model se učí spektrální tvar **vždy relativně k f0** — "peak mezi 2. a 3.
+harmonikem" se automaticky škáluje pro libovolnou výšku noty.
+
+```python
+# NoiseSynth.forward (zjednodušeno)
+f0_mean    = f0_hz.clamp(min=F0_MIN).mean(dim=1)              # (B,)
+stft_freqs = torch.arange(n_bins) * (SR / n_fft)             # (n_bins,)
+src_pos    = stft_freqs / f0_mean * (N / N_HARM)             # (B, n_bins)
+src_pos    = src_pos.clamp(0, N - 1)
+# bilineární interpolace mag_up na pozicích src_pos → mag_abs
+out = istft(stft * mag_abs, ...)
+```
+
+**Pokrytí noise binů** (N=513, N_HARM=128 po dev-adaptive-nharm):
+
+| Nota | f0 | Noise bins pokrývají do |
+|------|----|------------------------|
+| A0   | 27.5 Hz | 3 520 Hz (= N_HARM × f0) → zbytek flat |
+| A2   | 110 Hz  | 14 080 Hz |
+| A4   | 440 Hz  | Nyquist |
+
+Biny nad `N_HARM × f0` jsou clamped na poslední bin → šum je tam konstantní,
+ale harmonická struktura je zachycena správně v pokrytém pásmu.
+
+---
+
+### [dev-adaptive-nharm] Adaptivní počet harmonických — konec "muddy/LPF" basů
+
+**Problém**: `N_HARM = 32` nastavoval pevný strop pro všechny noty. Výsledkem bylo,
+že harmonický synth pokrýval jen zlomek slyšitelného spektra basových not:
+
+| Nota | f0 | N_HARM=32 pokryto do | Zbytek spektra |
+|------|----|----------------------|----------------|
+| A0   | 27.5 Hz | **880 Hz**    | 23 kHz = jen noise |
+| A1   | 55 Hz   | **1 760 Hz**  | 22 kHz = jen noise |
+| A2   | 110 Hz  | **3 520 Hz**  | 20 kHz = jen noise |
+| A4   | 440 Hz  | 14 080 Hz     | OK |
+
+Noise synth nad mezní frekvencí generuje filtrovaný šum bez harmonické struktury →
+basy znějí jako klavír za LPF filtrem, "muddy", bez "znělosti" v horním pásmu.
+
+**Řešení**: `N_HARM_MAX = 128`, počet aktivních harmonických adaptivní per batch item:
+
+```python
+# HarmonicSynth.forward
+f0_mean  = f0_up.mean(dim=-1)                                   # (B,)
+n_active = ((k.unsqueeze(0) * f0_mean.unsqueeze(1)) < SR * 0.45) \
+           .sum(dim=1).clamp(min=1).float()                     # (B,)
+...
+return signal / n_active.view(B, 1, 1)   # normalizace n_active, ne pevným N
+```
+
+Normalizace opravena z pevného `/N` na `/n_active` — hlasitost konzistentní bez ohledu
+na počet aktivních harmonických.
+
+**Výsledek po zvýšení N_HARM_MAX=32 → 128**:
+
+| Nota | f0 | n_active | Pokryto do | Zlepšení |
+|------|----|----------|-----------|----------|
+| A0   | 27.5 Hz | 128 | **3 520 Hz** | +4× |
+| A1   | 55 Hz   | 128 | **7 040 Hz** | +4× |
+| A2   | 110 Hz  | 109 | **11 925 Hz** | skoro plné |
+| A3   | 220 Hz  |  54 | plné (nyq.)  | = |
+| A4+  | ≥440 Hz |  ≤54| plné (nyq.)  | beze změny |
+
+Treble noty nejsou dotčeny — nyquist maska přirozeně omezí n_active.
+
+**Možné zvýšení pokud A0–A1 stále problematické po poslechu**:
+
+| N_HARM_MAX | A0 pokryto | Paměť tensoru (B=16, crop=200 fr) |
+|-----------|------------|-----------------------------------|
+| 128        | 3 520 Hz  | ~196 MB — **aktuální** |
+| 256        | 7 040 Hz  | ~393 MB — doporučený next step |
+| 512        | 14 080 Hz | ~786 MB — hranice CPU RAM |
+| 872 (full) | 24 000 Hz | ~1.3 GB — pouze GPU |
+
+Zvýšení na **256 je přirozený next step** po poslechu výsledků s 128.
+Provést změnou jediné konstanty: `N_HARM_MAX = 256` v `model_ddsp.py` + re-trénink.
+
+**Kombinace s [dev-noise-fft]**: harmonic-relative noise warping zajistí, že noise synth
+pokrývá zbytek spektra nad `N_HARM_MAX × f0` ve správném harmonickém kontextu.
+
+---
+
 ## Roadmap
 
 Pořadí reflektuje poměr přínos/náklady při **aktuálním hardwaru (CPU notebook)**.
@@ -134,16 +263,7 @@ GUI slider `unison_scale` (0–2), analogicky `inh_scale`.
 
 ---
 
-### 3. [dev-noise-amp] Globální amplituda šumové složky
-
-**Proč třetí (spolu s #2)**: po zavedení `head_amp_L/R` pro harmonické složky vznikla
-asymetrie — noise nemá globální scalar, model musí optimalizovat všech 129 binů najednou.
-Levná oprava (~5 řádků), vhodné přidat do dev-unison-spread branche.
-
-```python
-noise_amp_L = softplus(head_noise_amp_L(feat))   # nová hlava
-noise_L     = sigmoid(head_noise_L(feat)) * noise_amp_L
-```
+### ~~3. [dev-noise-amp] Globální amplituda šumové složky~~ → implementováno v dev-noise-fft
 
 ---
 
