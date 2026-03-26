@@ -425,23 +425,31 @@ def build_ui():
                     'Generuje WAV vzorky pomoci natrenovaneho modelu.\n'
                     'Vystup: `C:\\SoundBanks\\IthacaPlayer\\generated\\<nastroj>\\`'
                 )
-                gen_status_out   = gr.Textbox(label='Stav generovani', lines=2,
-                                              interactive=False, max_lines=2)
+                gen_status_out   = gr.Textbox(label='Stav generovani', lines=3,
+                                              interactive=False, max_lines=3)
                 gen_status_timer = gr.Timer(value=5)
 
                 def read_gen_status(instrument, workspace, output):
                     if not instrument:
                         return 'Zadejte adresar nastroje.'
                     name      = os.path.basename(instrument.rstrip('/\\'))
+                    work_dir  = (workspace or '').strip() or (instrument.rstrip('/\\') + '-ddsp')
+                    cfg_path  = os.path.join(work_dir, 'instrument.json')
+                    model_size = '?'
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, encoding='utf-8') as f:
+                            model_size = json.load(f).get('model_size', '?')
                     out_dir   = (output or '').strip() or os.path.join(ITHACA_ROOT, 'generated', name)
                     wav_files = glob.glob(os.path.join(out_dir, '*.wav'))
                     n_wav     = len(wav_files)
                     if n_wav == 0:
-                        return f'Zadne WAV soubory v {out_dir}'
+                        return (f'model: {model_size}\n'
+                                f'Zadne WAV soubory v {out_dir}')
                     total_mb  = sum(os.path.getsize(p) for p in wav_files) / 1e6
                     ts = time.strftime('%Y-%m-%d %H:%M',
                                        time.localtime(max(os.path.getmtime(p) for p in wav_files)))
-                    return (f'HOTOVO  {n_wav} WAV souboru  ({total_mb:.0f} MB)  '
+                    return (f'model: {model_size}\n'
+                            f'HOTOVO  {n_wav} WAV souboru  ({total_mb:.0f} MB)  '
                             f'posledni zmena [{ts}]\n'
                             f'vystup: {out_dir}')
 
