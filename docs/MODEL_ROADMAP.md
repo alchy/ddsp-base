@@ -64,6 +64,33 @@ CLI: `--inharmonicity-scale`, GUI: slider „Inharmonicity scale" (0.0–2.0).
 
 ---
 
+## Implementováno (pokračování)
+
+### [dev-noise-fft] NOISE_FFT 256 → 1024 + globální noise amplitude + MRSTFT 16384
+
+**Problém**: `NOISE_FFT = 256` dává rozlišení 187.5 Hz/bin. Pro A0 (27.5 Hz) leží
+celé basové spektrum v prvních 1–2 binech ze 129 → model nemůže naučit tvar šumové
+textury v basech. Výsledek: "filtrovaný/tlumený" zvuk v nízkých rejstřících,
+zatímco transpozice vyšších not do basu zní čistěji — potvrzeno poslechem D4→D2.
+
+**Řešení** (tři změny v jednom branchi):
+
+**B — NOISE_FFT: 256 → 1024** (model_ddsp.py):
+- `N_NOISE = 513` místo 129, rozlišení 46.9 Hz/bin (4× lepší)
+- A0: h1–h6 leží v binech 0–3 místo binu 0; model má prostor naučit texturní tvar
+- Nekompatibilní s předchozími checkpointy (head_noise L/R mají jiný výstup)
+
+**C — noise_amp globální scalar** (model_ddsp.py):
+- `head_noise_amp_L/R: mlp_dim → 1` (softplus), analogie s `head_amp_L/R` u harmonických
+- Oddělen tvar spektra (sigmoid, 513 binů) od celkové hlasitosti šumu (softplus, 1 hodnota)
+- Init bias = -3.0 → tiché na začátku, model se naučí zvyšovat dle potřeby
+
+**A — MRSTFT fft_sizes přidán 16384** (ddsp.py):
+- `fft_sizes=(256, 1024, 4096, 16384)` → 16384 dá 2.9 Hz/bin
+- A0 (27.5 Hz) leží v binu 9 místo binu 0 → loss konečně vidí basové harmonické
+
+---
+
 ## Roadmap
 
 Pořadí reflektuje poměr přínos/náklady při **aktuálním hardwaru (CPU notebook)**.
@@ -134,16 +161,7 @@ GUI slider `unison_scale` (0–2), analogicky `inh_scale`.
 
 ---
 
-### 3. [dev-noise-amp] Globální amplituda šumové složky
-
-**Proč třetí (spolu s #2)**: po zavedení `head_amp_L/R` pro harmonické složky vznikla
-asymetrie — noise nemá globální scalar, model musí optimalizovat všech 129 binů najednou.
-Levná oprava (~5 řádků), vhodné přidat do dev-unison-spread branche.
-
-```python
-noise_amp_L = softplus(head_noise_amp_L(feat))   # nová hlava
-noise_L     = sigmoid(head_noise_L(feat)) * noise_amp_L
-```
+### ~~3. [dev-noise-amp] Globální amplituda šumové složky~~ → implementováno v dev-noise-fft
 
 ---
 

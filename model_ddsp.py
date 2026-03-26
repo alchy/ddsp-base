@@ -26,8 +26,8 @@ import torch.nn.functional as F
 SR        = 48000
 FRAME_HOP = 240           # 5 ms per frame @ 48 kHz
 N_HARM    = 32            # harmonic oscillators
-NOISE_FFT = 256
-N_NOISE   = NOISE_FFT // 2 + 1   # = 129 spectral bins
+NOISE_FFT = 1024
+N_NOISE   = NOISE_FFT // 2 + 1   # = 513 spectral bins
 
 F0_MIN  = 20.0
 F0_MAX  = 5000.0
@@ -204,8 +204,11 @@ class DDSPVocoder(nn.Module):
         self.head_harm_R  = nn.Linear(mlp_dim, N_HARM)
         self.head_amp_L   = nn.Linear(mlp_dim, 1)
         self.head_amp_R   = nn.Linear(mlp_dim, 1)
-        self.head_noise_L = nn.Linear(mlp_dim, N_NOISE)
-        self.head_noise_R = nn.Linear(mlp_dim, N_NOISE)
+        self.head_noise_L     = nn.Linear(mlp_dim, N_NOISE)
+        self.head_noise_R     = nn.Linear(mlp_dim, N_NOISE)
+        # Global noise amplitude scalar — decouples spectral shape from level
+        self.head_noise_amp_L = nn.Linear(mlp_dim, 1)
+        self.head_noise_amp_R = nn.Linear(mlp_dim, 1)
 
         # Piano inharmonicity: single scalar B per note (pooled over T)
         # f_k = k·f0·√(1 + B·k²),  B_MAX is MIDI-dependent (see forward)
@@ -216,8 +219,10 @@ class DDSPVocoder(nn.Module):
         self.harm_synth  = HarmonicSynth()
         self.noise_synth = NoiseSynth()
 
-        nn.init.constant_(self.head_noise_L.bias, -3.0)
-        nn.init.constant_(self.head_noise_R.bias, -3.0)
+        nn.init.constant_(self.head_noise_L.bias,     -3.0)
+        nn.init.constant_(self.head_noise_R.bias,     -3.0)
+        nn.init.constant_(self.head_noise_amp_L.bias, -3.0)
+        nn.init.constant_(self.head_noise_amp_R.bias, -3.0)
 
     def forward(self, f0_hz, loudness_db, velocity=None, n_frames=None, inh_scale=1.0):
         """
@@ -247,8 +252,10 @@ class DDSPVocoder(nn.Module):
         harm_amp_R  = F.softplus(self.head_amp_R(feat))
         harm_amps_L = harm_dist_L * harm_amp_L
         harm_amps_R = harm_dist_R * harm_amp_R
-        noise_L     = torch.sigmoid(self.head_noise_L(feat))
-        noise_R     = torch.sigmoid(self.head_noise_R(feat))
+        noise_L     = torch.sigmoid(self.head_noise_L(feat)) \
+                      * F.softplus(self.head_noise_amp_L(feat))
+        noise_R     = torch.sigmoid(self.head_noise_R(feat)) \
+                      * F.softplus(self.head_noise_amp_R(feat))
 
         # Inharmonicity: MIDI-dependent B_MAX from mean F0, pooled scalar per note
         # B_MAX = 0.0008 · exp(-(midi-21)/88·ln10)  — basy ~0.0008, výšky ~0.00008

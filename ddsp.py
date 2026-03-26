@@ -379,7 +379,7 @@ def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
     return w_up
 
 
-def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096)):
+def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096, 16384)):
     B, C, T = pred.shape
     p_flat  = pred.reshape(B * C, T)
     t_flat  = target.reshape(B * C, T)
