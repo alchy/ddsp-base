@@ -32,7 +32,7 @@ def _attack_weight(lo_db: torch.Tensor, n_samples: int,
 
 
 def mrstft_loss(pred: torch.Tensor, target: torch.Tensor,
-                fft_sizes: tuple = (256, 1024, 4096, 16384)) -> torch.Tensor:
+                fft_sizes: tuple = (256, 1024, 4096)) -> torch.Tensor:
     """Multi-Resolution STFT loss.
 
     pred, target : (B, C, T)

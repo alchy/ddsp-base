@@ -26,7 +26,7 @@ from torch.utils.data import Dataset, Sampler
 from synth.constants import SR, FRAME_HOP
 
 # Default window sizes (frames)
-CROP_FRAMES_MAX  = 2000   # 10 s — deepest bass
+CROP_FRAMES_MAX  =  800   #  4 s — deepest bass (60 % of τ_slow≈6.7 s; CPU-feasible)
 CROP_FRAMES_MIN  =   50   # 0.25 s — treble (original)
 CROP_MIDI_LOW    =   24   # A0: full long window
 CROP_MIDI_HIGH   =   72   # C5: short window
