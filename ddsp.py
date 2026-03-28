@@ -652,7 +652,7 @@ def cmd_learn(args):
     # Training log
     log_f = open(ws.log_path, 'a', buffering=1)
     log_f.write(f'\n--- {_now()}  model={model_size}  epochs={tp['epochs']}  lr={lr_init}  '
-                f'profile={dev_type}  max_crop={max_crop} ---\n')
+                f'preset={tp["preset_name"]}  max_crop={max_crop} ---\n')
 
     def _get_loudness(loL, loR, vel_b, midi_b, start_b):
         """Return loudness tensor for a batch.
