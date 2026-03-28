@@ -358,7 +358,7 @@ def build_ui():
                     model_size = gr.Dropdown(
                         ['small', 'medium', 'large'], value='small',
                         label='Velikost modelu',
-                        info='small ~115K param (rychle CPU), medium ~452K, large ~2M'
+                        info='small ~238K param (rychle CPU), medium ~696K, large ~3.4M'
                     )
                     epochs_sl  = gr.Slider(10, 500, value=100, step=10,
                                            label='Pocet epoch',
@@ -496,6 +496,11 @@ def build_ui():
                                              label='Inharmonicity scale',
                                              info='0.0 = ciste harmonicke, 1.0 = naucene B, '
                                                   '2.0 = zesilenа inharmonicita.')
+                    decay_scale_sl = gr.Slider(0.0, 2.0, value=1.0, step=0.1,
+                                               label='Decay scale',
+                                               info='0.0 = zadny fyzikalni decay (plochy sustain), '
+                                                    '1.0 = naucene b1/b3 (fyzikalni), '
+                                                    '2.0 = rychlejsi doznivani.')
                     notes_in = gr.Textbox(label='Noty (note-list mod, prazdne = chyba)',
                                            placeholder='C3 A3 C4 A4 C5',
                                            info='Seznam not k vygenerovani. Pouziva se kdyz '
@@ -514,7 +519,7 @@ def build_ui():
                 gen_timer = gr.Timer(value=2)
 
                 def run_generate(instrument, workspace, full_range, midi_lo, midi_hi,
-                                 vel_layers, env_src, atk_ramp, wet, inh_scale,
+                                 vel_layers, env_src, atk_ramp, wet, inh_scale, decay_scale,
                                  notes, output, no_skip_val, device):
                     if not instrument:
                         return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
@@ -522,6 +527,7 @@ def build_ui():
                             '--envelope-source', env_src,
                             '--attack-ramp-ms', str(int(atk_ramp)),
                             '--inharmonicity-scale', f'{inh_scale:.2f}',
+                            '--decay-scale', f'{decay_scale:.2f}',
                             '--vel-layers', str(int(vel_layers)),
                             '--device', device]
                     if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
@@ -541,7 +547,7 @@ def build_ui():
                                inputs=[instrument_in, workspace_in, full_range_chk,
                                        midi_lo_sl, midi_hi_sl, vel_layers_sl,
                                        env_source_radio, attack_ramp_sl,
-                                       wet_sl, inh_scale_sl, notes_in,
+                                       wet_sl, inh_scale_sl, decay_scale_sl, notes_in,
                                        output_in, no_skip, device_dd],
                                outputs=[gen_cmd_out, gen_log])
                 gen_stop.click(fn=stop_command, outputs=gen_log)

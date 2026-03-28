@@ -357,14 +357,16 @@ def find_envelope(templates: dict, midi: int, vel: int) -> np.ndarray:
 @torch.no_grad()
 def synthesize(model: DDSPVocoder, midi: int, velocity: float,
                loudness: np.ndarray, device: torch.device,
-               inh_scale: float = 1.0) -> np.ndarray:
+               inh_scale: float = 1.0,
+               decay_scale: float = 1.0) -> np.ndarray:
     """Synthesize one note -> (2, T) float32"""
     n_frames = len(loudness)
     freq     = 440.0 * (2.0 ** ((midi - 69) / 12.0))
     f0_t  = torch.from_numpy(np.full(n_frames, freq, np.float32)).unsqueeze(0).to(device)
     lo_t  = torch.from_numpy(loudness).unsqueeze(0).to(device)
     vel_t = torch.tensor([float(velocity)], dtype=torch.float32, device=device)
-    out   = model(f0_t, lo_t, vel_t, n_frames, inh_scale=inh_scale)
+    out   = model(f0_t, lo_t, vel_t, n_frames, inh_scale=inh_scale,
+                  decay_scale=decay_scale)
     return out[0].cpu().numpy()   # (2, T)
 
 
@@ -756,6 +758,7 @@ def cmd_generate(args):
 
     attack_ramp_ms = getattr(args, 'attack_ramp_ms', 10)
     inh_scale      = float(getattr(args, 'inh_scale', 1.0))
+    decay_scale    = float(getattr(args, 'decay_scale', 1.0))
 
     wet    = float(np.clip(getattr(args, 'wet', 1.0), 0.0, 1.0))
     n_vel  = args.vel_layers
@@ -816,7 +819,8 @@ def cmd_generate(args):
                         loudness = env_model.predict_envelope(midi, vel, warp=env_model._warp)
                     else:
                         loudness = find_envelope(templates, midi, vel)
-                    audio    = synthesize(model, midi, float(vel), loudness, device, inh_scale=inh_scale)
+                    audio    = synthesize(model, midi, float(vel), loudness, device,
+                                         inh_scale=inh_scale, decay_scale=decay_scale)
                     audio    = apply_attack_ramp(audio, attack_ramp_ms)
                     dur_s    = len(loudness) * FRAME_HOP / SR
                     save_wav(out_path, audio, SR)
@@ -896,7 +900,8 @@ def cmd_generate(args):
                 else:
                     loudness = find_envelope(templates, midi, vel)
                 dur_s = len(loudness) * FRAME_HOP / SR
-                audio = synthesize(model, midi, float(vel), loudness, device, inh_scale=inh_scale)
+                audio = synthesize(model, midi, float(vel), loudness, device,
+                                   inh_scale=inh_scale, decay_scale=decay_scale)
                 if wet < 1.0:
                     ref = load_wav_stereo(wav_lookup[(midi, vel)], target_sr=SR)
                     T   = ref.shape[-1]
@@ -1011,6 +1016,9 @@ def main():
     p_gen.add_argument('--inharmonicity-scale', type=float, default=1.0, metavar='0-2',
                        dest='inh_scale',
                        help='Inharmonicity multiplier: 0=pure harmonic, 1=learned B, 2=exaggerated (default: 1.0)')
+    p_gen.add_argument('--decay-scale', type=float, default=1.0, metavar='0-2',
+                       dest='decay_scale',
+                       help='Physics decay multiplier: 0=no decay, 1=learned b1/b3, 2=faster doznivani (default: 1.0)')
     p_gen.add_argument('--output',  default=None, metavar='DIR',
                        help=f'Output directory (default: {ITHACA_PLAYER_ROOT}\\<instrument>)')
     p_gen.add_argument('--notes',   nargs='+', default=None, metavar='NOTE',

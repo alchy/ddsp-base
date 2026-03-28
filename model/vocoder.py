@@ -7,13 +7,15 @@ Architecture (Decoupled Timbre):
     Heads:  predict synthesis parameters for HarmonicSynth + NoiseSynth
     Output: (B, 2, n_samples) stereo audio at sample rate SR
 
-Loudness is applied as a linear envelope after synthesis so the network
-learns pure timbre independently of dynamics.
+Loudness is applied as a linear envelope after synthesis.
 
-Per-partial physics decay (Phase 1 — bass refactor):
-    σ_k = b1 + b3 · (2π · k · f0_mean)²     [Simionato 2024, Bensa 2003]
-    b1, b3 are learned scalars pooled over T (note-level constants).
-    Init: b1 ≈ 0.31 s⁻¹,  b3 ≈ 1.1e-7  (close to Steinway D values).
+Physics decay (Phase 2 — two-component model, Weinreich 1977, Bensa 2003):
+    Two string polarizations (vertical fast, horizontal slow):
+    σ_k_fast = b1_f + b3_f · (2π·k·f0)²
+    σ_k_slow = b1_s + b3_s · (2π·k·f0)²
+    d_k(t) = α · exp(-σ_k_fast · t) + (1-α) · exp(-σ_k_slow · t)
+
+    decay_scale (inference only): 0=no decay, 1=learned, >1=faster doznívání
 """
 
 import math
@@ -32,9 +34,6 @@ from model.encoders import encode_f0, encode_velocity
 class DDSPVocoder(nn.Module):
     """
     Fully stereo DDSP vocoder conditioned on (F0, loudness, velocity).
-
-    Independent harmonic and noise parameters for L and R channels
-    allow the network to capture spatial timbre differences.
 
     Returns: (B, 2, n_samples)
     """
@@ -65,20 +64,32 @@ class DDSPVocoder(nn.Module):
         self.head_noise_amp_L = nn.Linear(mlp_dim, 1)
         self.head_noise_amp_R = nn.Linear(mlp_dim, 1)
 
-        # Inharmonicity: single scalar B per note (pooled over T)
-        # f_k = k·f0·√(1 + B·k²),  B_MAX is MIDI-dependent
-        # init bias=-5 → sigmoid≈0.007 → B≈0 at start
+        # Inharmonicity: scalar B per note (pooled over T), MIDI-dependent B_MAX
+        # init: sigmoid≈0.007 → B≈0 at start
         self.head_B = nn.Linear(mlp_dim, 1)
         nn.init.constant_(self.head_B.bias, -5.0)
 
-        # Per-partial physics decay: σ_k = b1 + b3 · (2π · k · f0)²
-        # Pooled over T — note-level constants (physics: decay rate doesn't vary per frame)
-        # b1 init: softplus(-1.0) ≈ 0.31 s⁻¹  (Steinway D: ~0.3)
-        # b3 init: softplus(-16.0) ≈ 1.1e-7    (Steinway D: ~1e-7)
-        self.head_b1 = nn.Linear(mlp_dim, 1)
-        self.head_b3 = nn.Linear(mlp_dim, 1)
-        nn.init.constant_(self.head_b1.bias, -1.0)
-        nn.init.constant_(self.head_b3.bias, -16.0)
+        # Two-component physics decay (note-level scalars, pooled over T)
+        #
+        # Fast component (vertical polarization, stronger coupling to soundboard):
+        #   b1_f init: softplus(0.5) ≈ 0.97 s⁻¹  → τ_fast ≈ 1.0 s
+        #   b3_f init: softplus(-15) ≈ 3e-7        (freq-dependent term)
+        #
+        # Slow component (horizontal polarization, weaker coupling):
+        #   b1_s init: softplus(-1.7) ≈ 0.15 s⁻¹ → τ_slow ≈ 6.7 s
+        #   b3_s init: softplus(-19) ≈ 5e-9        (very weak freq-dep)
+        #
+        # alpha: fast fraction — sigmoid(0) = 0.5 (equal excitation at start)
+        self.head_b1_f  = nn.Linear(mlp_dim, 1)
+        self.head_b3_f  = nn.Linear(mlp_dim, 1)
+        self.head_b1_s  = nn.Linear(mlp_dim, 1)
+        self.head_b3_s  = nn.Linear(mlp_dim, 1)
+        self.head_alpha = nn.Linear(mlp_dim, 1)
+        nn.init.constant_(self.head_b1_f.bias,   0.5)
+        nn.init.constant_(self.head_b3_f.bias,  -15.0)
+        nn.init.constant_(self.head_b1_s.bias,  -1.7)
+        nn.init.constant_(self.head_b3_s.bias,  -19.0)
+        nn.init.constant_(self.head_alpha.bias,   0.0)
 
         self.harm_synth  = HarmonicSynth()
         self.noise_synth = NoiseSynth()
@@ -90,12 +101,14 @@ class DDSPVocoder(nn.Module):
 
     def forward(self, f0_hz: torch.Tensor, loudness_db: torch.Tensor,
                 velocity=None, n_frames: int = None,
-                inh_scale: float = 1.0) -> torch.Tensor:
+                inh_scale: float = 1.0,
+                decay_scale: float = 1.0) -> torch.Tensor:
         """
         f0_hz       : (B, T)  Hz, 0 = unvoiced
         loudness_db : (B, T)  dB — applied post-synthesis as amplitude envelope
         velocity    : (B,)    MIDI velocity bucket 0–7
-        inh_scale   : float   0 = no inharmonicity, 1 = learned B, 2 = double
+        inh_scale   : float   0 = no inharmonicity, 1 = learned B, 2 = exaggerated
+        decay_scale : float   0 = no physics decay, 1 = learned, >1 = faster decay
         """
         B, T = f0_hz.shape
         if n_frames is None:
@@ -103,7 +116,7 @@ class DDSPVocoder(nn.Module):
         if velocity is None:
             velocity = torch.full((B,), 5.0, dtype=torch.float32, device=f0_hz.device)
 
-        # Encode conditioning — loudness excluded from timbre network
+        # Encode conditioning
         f0_enc  = encode_f0(f0_hz, F0_BINS)
         vel_enc = encode_velocity(velocity, VEL_DIM).unsqueeze(1).expand(-1, T, -1)
         feat    = torch.cat([f0_enc, vel_enc], dim=-1)
@@ -126,21 +139,26 @@ class DDSPVocoder(nn.Module):
         noise_R = torch.sigmoid(self.head_noise_R(feat)) \
                   * F.softplus(self.head_noise_amp_R(feat))
 
-        # Inharmonicity: MIDI-dependent B_MAX, scalar per note (pooled over T)
+        # Inharmonicity: MIDI-dependent B_MAX, pooled over T
         f0_mean  = f0_hz.clamp(min=F0_MIN).mean(dim=1)
         midi_est = 69.0 + 12.0 * torch.log2(f0_mean / 440.0)
         b_max    = 0.0008 * torch.exp(-(midi_est - 21.0) / 88.0 * math.log(10.0))
         inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) \
                    * b_max * inh_scale
 
-        # Per-partial physics decay (note-level scalars pooled over T)
-        b1 = F.softplus(self.head_b1(feat)).squeeze(-1).mean(dim=1)  # (B,)
-        b3 = F.softplus(self.head_b3(feat)).squeeze(-1).mean(dim=1)  # (B,)
+        # Two-component physics decay (note-level scalars, pooled over T)
+        b1_f  = F.softplus(self.head_b1_f(feat)).squeeze(-1).mean(dim=1)  * decay_scale
+        b3_f  = F.softplus(self.head_b3_f(feat)).squeeze(-1).mean(dim=1)  * decay_scale
+        b1_s  = F.softplus(self.head_b1_s(feat)).squeeze(-1).mean(dim=1)  * decay_scale
+        b3_s  = F.softplus(self.head_b3_s(feat)).squeeze(-1).mean(dim=1)  * decay_scale
+        alpha = torch.sigmoid(self.head_alpha(feat)).squeeze(-1).mean(dim=1)
 
         # Synthesis
         n_samples   = n_frames * FRAME_HOP
-        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh, b1=b1, b3=b3)
-        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh=inh, b1=b1, b3=b3)
+        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh,
+                                      b1_f, b3_f, b1_s, b3_s, alpha)
+        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh,
+                                      b1_f, b3_f, b1_s, b3_s, alpha)
         noise_sig_L = self.noise_synth(noise_L, f0_hz, n_samples)
         noise_sig_R = self.noise_synth(noise_R, f0_hz, n_samples)
 
