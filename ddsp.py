@@ -39,7 +39,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from model_ddsp import (
     build_ddsp, count_params, FRAME_HOP, SR, F0_MAX,
@@ -47,8 +47,8 @@ from model_ddsp import (
     EnvelopeNet, N_ENV, ENVELOPE_WARP,
 )
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
-
-CROP_FRAMES = 50   # 0.25 s of frames per training window
+from training.dataset import SourceDataset, crop_frames, CROP_FRAMES_MIN as CROP_FRAMES
+from training.loss    import mrstft_loss, _attack_weight
 
 # IthacaPlayer output root — generated sample banks land here
 ITHACA_PLAYER_ROOT = os.environ.get('ITHACA_ROOT', r'C:\SoundBanks\IthacaPlayer')
@@ -282,120 +282,6 @@ def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0,
             import traceback; traceback.print_exc()
     print(f'[extract] {n_new} new file(s) cached.')
     return n_new
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class SourceDataset(Dataset):
-    def __init__(self, extracts_dir: str, min_voiced: float = 0.1):
-        self.crop  = CROP_FRAMES
-        self.hop   = FRAME_HOP
-        self.items = []
-        self.data  = []
-        self.midi_per_file = []   # midi note per NPZ file (for coupled training)
-        npz_files  = sorted(glob.glob(os.path.join(extracts_dir, '*.npz')))
-        if not npz_files:
-            raise FileNotFoundError(
-                f'No NPZ files in {extracts_dir}.\n'
-                f'Run: python ddsp.py extract --instrument <path>'
-            )
-        total_frames = 0
-        for fi, path in enumerate(npz_files):
-            print(f'  loading {os.path.basename(path)} ...', flush=True)
-            raw = np.load(path)
-            d   = {k: raw[k].copy() for k in raw.files}
-            self.data.append(d)
-            parsed = parse_filename(path)
-            self.midi_per_file.append(parsed[0] if parsed else 60)
-            T   = len(d['f0'])
-            if T < self.crop + 1:
-                continue
-            step = max(1, self.crop // 2)
-            for start in range(0, T - self.crop, step):
-                if d['voiced_prob'][start:start + self.crop].mean() >= min_voiced:
-                    self.items.append((fi, start))
-            total_frames += T
-        if not self.items:
-            print('[dataset] WARNING: no voiced windows found -- using all windows.')
-            for fi, d in enumerate(self.data):
-                T = len(d['f0'])
-                for start in range(0, T - self.crop, self.crop // 4):
-                    self.items.append((fi, start))
-        dur = total_frames / (SR / FRAME_HOP)
-        print(f'[dataset] {len(npz_files)} file(s)  {dur:.0f}s  {len(self.items)} windows')
-
-    def __len__(self): return len(self.items)
-
-    def __getitem__(self, idx):
-        fi, start = self.items[idx]
-        d  = self.data[fi]
-        sl = slice(start, start + self.crop)
-        f0  = d['f0'][sl].astype(np.float32)
-        loL = d['loudness_L'][sl].astype(np.float32)
-        loR = d['loudness_R'][sl].astype(np.float32)
-        vp  = d['voiced_prob'][sl].astype(np.float32)
-        s_s = start * self.hop
-        audio = d['audio'][:, s_s:s_s + self.crop * self.hop].astype(np.float32)
-        if random.random() < 0.5:
-            db  = random.uniform(-2.0, 2.0)
-            g   = 10.0 ** (db / 20.0)
-            audio = audio * g; loL += db; loR += db
-        vel_mean = float(d['vel_frames'][sl].mean())
-        midi     = self.midi_per_file[fi]
-        return (torch.from_numpy(f0), torch.from_numpy(loL), torch.from_numpy(loR),
-                torch.from_numpy(vp), torch.from_numpy(audio),
-                torch.tensor(vel_mean, dtype=torch.float32),
-                torch.tensor(midi,     dtype=torch.long),
-                torch.tensor(start,    dtype=torch.long))
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
-    """Attack-emphasis weight upsampled to sample level.
-
-    lo_db   : (B, F) loudness in dB per frame
-    returns : (B, 1, n_samples) weight tensor, floor=1.0, peak=1+alpha
-    """
-    B, n_frames = lo_db.shape
-    # Gaussian smooth along time
-    radius = int(4 * sigma + 0.5)
-    k = torch.arange(-radius, radius + 1, dtype=lo_db.dtype, device=lo_db.device)
-    kernel = torch.exp(-0.5 * (k / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    lo_smooth = F.conv1d(lo_db.unsqueeze(1), kernel.view(1, 1, -1), padding=radius).squeeze(1)
-    # Positive derivative = attack
-    dl = torch.diff(lo_smooth, prepend=lo_smooth[:, :1], dim=1)
-    dl_pos = dl.clamp(min=0.0)
-    dl_norm = dl_pos / (dl_pos.amax(dim=1, keepdim=True) + 1e-6)
-    attack_w = 1.0 + alpha * dl_norm                        # (B, F)
-    # Upsample to sample resolution
-    w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples,
-                         mode='linear', align_corners=False)  # (B, 1, n_samples)
-    return w_up
-
-
-def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096, 16384)):
-    B, C, T = pred.shape
-    p_flat  = pred.reshape(B * C, T)
-    t_flat  = target.reshape(B * C, T)
-    total, n_valid = pred.sum() * 0.0, 0
-    for n_fft in fft_sizes:
-        if n_fft >= T: continue
-        hop = n_fft // 4
-        win = torch.hann_window(n_fft, device=pred.device)
-        Sp  = torch.stft(p_flat, n_fft, hop, n_fft, win, return_complex=True)
-        St  = torch.stft(t_flat, n_fft, hop, n_fft, win, return_complex=True)
-        mp  = (Sp.real.pow(2) + Sp.imag.pow(2) + 1e-8).sqrt()
-        mt  = (St.real.pow(2) + St.imag.pow(2) + 1e-8).sqrt()
-        sc  = ((mp - mt).pow(2).sum() + 1e-8).sqrt() / (mt.pow(2).sum() + 1e-8).sqrt()
-        lm  = F.l1_loss(torch.log(mp + 1e-7), torch.log(mt + 1e-7))
-        total += sc + lm; n_valid += 1
-    return total / max(n_valid, 1)
 
 
 # ---------------------------------------------------------------------------

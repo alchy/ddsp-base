@@ -193,118 +193,148 @@ pokrývá zbytek spektra nad `N_HARM_MAX × f0` ve správném harmonickém konte
 
 ---
 
-## Roadmap
+## Implementováno (pokračování)
 
-Pořadí reflektuje poměr přínos/náklady při **aktuálním hardwaru (CPU notebook)**.
-dev-frame-rate je správný dlouhodobý směr — ale stojí nejvíc a vyžaduje M5.
-Nejdřív levné změny s vysokým přínosem, velká přestavba pipeline až s výkonným hardwarem.
+### [dev-bass-refactor / Phase 0] Framework restructure + adaptivní tréninkové okno
+
+**Motivace (z analýzy 18 physics papers)**:
+Diagnóza zjistila 6 příčin problematického zvuku basů. Nejzávažnější je
+**tréninkové okno příliš krátké na zachycení basového doznívání**:
+- CROP_FRAMES = 50 → 250 ms
+- A0 (MIDI 21): délka samplu ~29 s, τ_slow ≈ 5 s
+- Model vidí méně než 1 % délky noty — nikdy nepozoruje pomalé doznívání
+
+**Provedené změny**:
+
+1. **Framework restructure** — čistá reorganizace, žádná logická změna:
+   ```
+   synth/    constants.py, harmonic.py, noise.py, __init__.py
+   model/    vocoder.py, encoders.py, envelope.py, __init__.py
+   training/ dataset.py, loss.py, __init__.py
+   model_ddsp.py → backward-compat shim (re-exportuje z frameworku)
+   ```
+
+2. **Adaptivní `crop_frames(midi)`** (`training/dataset.py`):
+   ```python
+   def crop_frames(midi: int) -> int:
+       t = (midi - 24) / (72 - 24)          # 0.0 = A0-ish,  1.0 = C5
+       t = max(0.0, min(1.0, t))
+       return int(round(2000 + t * (50 - 2000)))
+   # MIDI 21  → 2000 fr = 10 s  (2× τ_slow)
+   # MIDI 48  → 1025 fr = 5 s
+   # MIDI 72+ →   50 fr = 0.25 s (původní chování)
+   ```
 
 ---
 
-### 1. [dev-attack-loss] Attack-weighted loss pomocí obálky
+## Roadmap — [dev-bass-refactor]
 
-**Proč první**: 20 řádků kódu, žádná změna architektury, žádné nové checkpointy.
-Primárně diagnostická — odpoví na otázku *kolik z chybějícího attacku je tréninková
-záležitost* před tím, než investujeme do dev-frame-rate. Pokud přínos bude viditelný,
-kombinovat s dev-unison-spread (stejný trénink). Pokud marginální, potvrdit závěr
-a přejít na dev-unison-spread bez dalšího ladění lossu.
+Pořadí fází odpovídá přínosu a závislosti. Každá fáze je testovatelná samostatně.
 
+---
+
+### Phase 1. [dev-bass-refactor] Per-parciální σ_j decay
+
+**Zdroj**: Simionato 2024, Bensa 2003 — freq-dependent decay rate ověřený ve studii.
+
+**Fyzika**: každý parciál j doznívá s vlastní rychlostí:
+```
+σ_j = b1 + b3 · ωj²        # ωj = 2π · f_j,  b1 ≈ 0.3, b3 ≈ 1e-7 (Steinway D)
+A_j(t) = A_j(0) · exp(-σ_j · t)
+```
+Vyšší parciály mizí rychleji → přirozené "otevírání a zavírání" spektra při doznívání.
+Bez toho: všechny parciály doznívají stejně → zvuk znít umele staticky.
+
+**Nové hlavy v DDSPVocoder**:
 ```python
-lo_smooth  = gaussian_filter1d(lo_db, sigma=2, dim=-1)
-dl         = torch.diff(lo_smooth, prepend=lo_smooth[:, :1], dim=1)
-dl_pos     = torch.clamp(dl, min=0.0)
-dl_norm    = dl_pos / (dl_pos.amax(dim=1, keepdim=True) + 1e-6)
-attack_w   = 1.0 + alpha * dl_norm          # alpha=4.0, floor=1.0
-attack_w_up = upsample(attack_w, n_samples)
-
-loss = mrstft(pred, target) + beta * mrstft(pred * attack_w_up, target * attack_w_up)
-# beta=0.3; váhy jdou na vstup MRSTFT (ne na loss číslo) → musí být hladké
+self.head_b1 = nn.Linear(mlp_dim, 1)    # baseline decay (sdílený L+R)
+self.head_b3 = nn.Linear(mlp_dim, 1)    # freq-dep. koefficient (sdílený L+R)
+nn.init.constant_(self.head_b1.bias, -2.0)   # softplus → ~0.13 na startu
+nn.init.constant_(self.head_b3.bias, -16.0)  # softplus → ~1e-7 na startu
 ```
 
-**Strop**: pro treble noty (C7 = 2 framy attacku) je limit architektonický —
-attack-loss nemůže překročit informaci, která v sekvenci není.
-
----
-
-### 2. [dev-unison-spread] Unison spread — rozladění strun
-
-**Proč druhý**: fyzikální model klavíru je bez unison spreadu fundamentálně neúplný.
-Inharmonicita (dev-inharmonicity) opravila frekvenční rozmístění parciálů — ale každý
-parciál stále pochází z jednoho oscilátoru. Reálné piano má 2–3 struny na notu,
-záměrně rozladěné o ~0.3–2 cent → **beating** = charakteristická "živost" a "dýchání"
-sustainu. Bez toho bude sustain vždy znít staticky bez ohledu na loss funkci.
-Implementace nepotřebuje změny pipeline, zvládne to CPU.
-
-**Fyzika**: jev je steady-state (přítomen po celou dobu tónu), nejsilnější v basech.
-Není to inharmonicita ani transient — jde o interakci mezi strunami v unisonové skupině.
-
+**HarmonicSynth.forward** — per-parciální amplituda s decay envelope:
 ```python
-# DDSPVocoder.__init__
-self.head_detune = nn.Linear(mlp_dim, 1)
-nn.init.constant_(self.head_detune.bias, -6.0)   # sigmoid ≈ 0.002 → delta ≈ 0 na startu
-
-# DDSPVocoder.forward
-DELTA_MAX = 0.003    # ~5 cent horní mez (fyzikálně: basy až 2 cent, treble 0.3 cent)
-delta = torch.sigmoid(self.head_detune(feat)).squeeze(-1).mean(dim=1) * DELTA_MAX
-
-# HarmonicSynth.forward — druhý oscilátor s f × (1 + delta)
-inst_freq_A = f0_up.unsqueeze(1) * (k * stretch).unsqueeze(2)
-inst_freq_B = inst_freq_A * (1.0 + delta.view(B, 1, 1))
-phase_A = torch.cumsum(2π * inst_freq_A / SR, dim=-1)
-phase_B = torch.cumsum(2π * inst_freq_B / SR, dim=-1)
-signal  = (a * (torch.sin(phase_A) + torch.sin(phase_B))).sum(dim=1) / (2 * N)
+b1 = F.softplus(head_b1(feat)).mean(dim=1)   # (B,)
+b3 = F.softplus(head_b3(feat)).mean(dim=1)   # (B,)
+f_j = f0_mean.unsqueeze(1) * k               # (B, N)  Hz
+omega_j = 2 * pi * f_j
+sigma_j = b1.unsqueeze(1) + b3.unsqueeze(1) * omega_j**2  # (B, N)
+t_frames = torch.arange(T, device) * FRAME_HOP / SR       # (T,)
+decay_env = torch.exp(-sigma_j.unsqueeze(2) * t_frames)   # (B, N, T)
+harm_amps_decayed = harm_amps.unsqueeze(2) * decay_env     # (B, N, T)
 ```
 
-Beating frekvence = `delta × f_k` → A4 (440 Hz), delta=0.001:
-beat na k=1: 0.44 Hz, na k=10: 4.4 Hz — slyšitelný chorusing.
-
-Kombinovat s **dev-noise-amp** (viz níže) — oboje jde do stejného branche, +5 řádků navíc.
-GUI slider `unison_scale` (0–2), analogicky `inh_scale`.
+**Kompatibilita**: nové checkpointy (head_b1/b3 přidány). Starý checkpoint nelze načíst.
 
 ---
 
-### ~~3. [dev-noise-amp] Globální amplituda šumové složky~~ → implementováno v dev-noise-fft
+### Phase 2. [dev-bass-refactor] AM beating — zig-zag polarizace strun
+
+**Zdroj**: Weinreich 1977, Hall 1986, Conklin 1990 — zig-zag polarizace ověřena měřením.
+
+**Fyzika**: každá struna vibruje ve dvou polarizacích (vertikální + horizontální).
+- Vertikální (rychlejší doznívání): τ_fast ≈ 0.5–2 s
+- Horizontální (pomalejší doznívání): τ_slow ≈ 3–8 s
+
+Výsledek = AM modulace na každém parciálu j s beat rate 1–5 Hz:
+```
+A_j(t) = a_fast_j · exp(-t/τ_fast) + a_slow_j · exp(-t/τ_slow)
+```
+Nikoli frekvenční detuning (to je inharmonicita) — ale amplitudová modulace.
+
+**Nové hlavy**:
+```python
+self.head_am_j     = nn.Linear(mlp_dim, 1)   # AM hloubka (α_j)
+self.head_am_rate  = nn.Linear(mlp_dim, 1)   # beat rate Hz (1–5 Hz)
+self.head_tau_fast = nn.Linear(mlp_dim, 1)   # τ_fast v sekundách
+self.head_tau_slow = nn.Linear(mlp_dim, 1)   # τ_slow v sekundách
+```
+
+**Požadavek na okno**: τ_slow = 5 s → nutné ≥ 2000 framů (10 s okno z Phase 0).
+Bez Phase 0 nelze Phase 2 natrénovat — závislost je tedy pevná.
 
 ---
 
-### 4. [dev-frame-rate] Adaptivní frame rate řízený obálkou
+### Phase 3. [dev-bass-refactor] Phantom partials (geometrická nelinearita)
 
-**Proč čtvrtý**: správná diagnóza, špatný timing na CPU. `FRAME_HOP = 240 samples = 5 ms`
-dává C7 attacku **2 framy** — lineární interpolace mezi nimi nemůže zachytit rychlou
-spektrální evoluci. Toto je fundamentální limit architektury, ne tréninková záležitost.
-Implementace ale stojí: NPZ re-extrakce (~55 min), změny dataset loaderu, nové pozicové
-kódování, 4× hustší sekvence v attack části = 4× více výpočtu. Na CPU je to neúnosné.
+**Zdroj**: Conklin 1996, Chaigne & Kergomard — podélné vlny + geometrická nelinearita.
+
+**Fyzika**: velké výchylky struna (basy) způsobují podélné vlny.
+- Podélná vlna f_L ≈ 28 × f_T (transverzální) → krátký burst na začátku
+- Geometrická nelinearita generuje phantom partials: 2·f_j a f_i ± f_j
+- Tyto frekvence nejsou v harmonické řadě → NoiseSynth je aktuálně pohltí jako šum
+
+**Implementace**: přidat N_PHANTOM = 8–16 dedikovaných oscilátorů:
+```python
+self.head_phantom   = nn.Linear(mlp_dim, N_PHANTOM)   # magnitudy
+self.head_phantom_f = nn.Linear(mlp_dim, N_PHANTOM)   # relative frekvence (2·k)
+```
+
+**Priorita**: nižší než Phase 1 + 2. Phantom partials jsou perceptuálně viditelné
+hlavně v hlubokých basech A0–A2, po opravě decay a AM to bude otázka doladění.
+
+---
+
+### Phase 4. [dev-frame-rate] Adaptivní frame rate (čeká na M5)
+
+**Proč odloženo**: FRAME_HOP = 240 samples = 5 ms dává C7 attacku 2 framy.
+Na CPU je to neúnosné — implementace by stála NPZ re-extrakci + 4× více výpočtu.
 
 **Správné okno**: příchod M5. Pak implementovat jako první velkou změnu.
-
-**Řešení**: envelope-guided variable frame rate
 
 ```python
 # dL/dt > 0 (attack)  → FRAME_HOP_ATTACK  = 60 samples (1.25 ms)
 # dL/dt ≤ 0 (sustain) → FRAME_HOP_SUSTAIN = 240 samples (5 ms)
-
-# Pozicové kódování pro GRU — v sample jednotkách, normalizované FRAME_HOP
-t_enc = frame_samples / FRAME_HOP   # attack step=0.25, sustain step=1.0
-feat  = cat([f0_enc, vel_enc, time_enc], dim=-1)
 ```
-
-C7 attack (10ms) → 8 framů místo 2. A0 attack (80ms) → 64 framů místo 16.
-
-| Komponenta | Změna |
-|-----------|-------|
-| NPZ extrakce | ukládat frame_samples (absolutní pozice v samples), adaptivní hop |
-| Dataset loader | variabilní frame sekvence, předávat frame_samples |
-| DDSPVocoder | přidat `time_enc` do `feat_dim` |
-| HarmonicSynth | beze změny (pracuje v samples) |
-
-Po dev-frame-rate odblokovat **transient spectral evolution** (time-varying B(t) —
-nelinearita kontaktu kladívka, rychlá spektrální evoluce prvních 5–20 ms attacku).
 
 ---
 
 ## Poznámky
 
-- dev-attack-loss: zpětně kompatibilní, žádné nové checkpointy
-- dev-unison-spread + dev-noise-amp: jeden branch, nové checkpointy
-- dev-frame-rate: čeká na M5, největší pipeline změna projektu
+- Phase 0 (framework + adaptivní okno): **implementováno** na dev-bass-refactor
+- Phase 1 (σ_j decay): nové checkpointy; testovat small model 50 epoch
+- Phase 2 (AM beating): závislé na Phase 0 (potřebuje dlouhá okna)
+- Phase 3 (phantom partials): nezávislé, doladění po Phase 1+2
+- Phase 4 (frame rate): čeká na M5, největší pipeline změna projektu
 - Testovat vždy small model (50 epoch) před medium (300 epoch)
