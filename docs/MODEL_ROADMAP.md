@@ -235,6 +235,52 @@ Smysluplné až po adaptivním frame rate nebo solo pro basy (80 ms attack = 16 
 
 ---
 
+## Kapacita modelu — analýza po Phase 0–2
+
+### Parametrické složení
+
+| Složka | small | medium | large |
+|--------|-------|--------|-------|
+| pre/post MLP | 34K | 118K | 432K |
+| GRU | 37K | 247K | 1 381K |
+| Harm heads (L+R) | 33K | 66K | 131K |
+| Noise heads (L+R) | **133K** | **264K** | **527K** |
+| Physics (b1/b3/alpha/B) | 0.8K | 1.5K | 3K |
+| **Celkem** | **238K** | **697K** | **2 475K** |
+
+### Upozornění: small + Phase 0 (dlouhé sekvence)
+
+Phase 0 dává A0 notám okno 2000 framů (10 s). `small` model má:
+- 1-vrstvý GRU, hidden=64
+- Gradient přes 2000 kroků v mělkém GRU je náchylný k úniku/zániku
+- Výsledek: model se nenaučí dlouhodobé decay vzory, přestože trénovací okno je dostatečné
+
+**Doporučení**: pro nástroje s basovým registrem používat `medium` jako výchozí
+(2-vrstvý GRU, hidden=128). `small` ponechat pro rychlé diagnostické trénování (50 epoch).
+
+### Nevyváženost noise vs GRU (small model)
+
+`small`: noise heads 133K vs GRU 37K — síť má 3.6× více kapacity pro tvar šumu
+než pro dynamiku. Po Phase 2 (physics decay) je GRU méně zatížen, ale tato nevyváženost
+zůstává nevhodná pokud je cílem naučit se jemné registrové rozdíly barvy.
+
+Zvážit v budoucnosti: konfigurovatelné N_NOISE per model size (nebo sdílené L/R noise head).
+
+### Strategie postupného zvyšování hloubky
+
+Analogie z ML praxe: trénovat na daném hardware do dosažení plateau val loss,
+pak přidat vrstvu GRU (gru_layers += 1) nebo zvýšit hidden.
+
+Konkrétně pro tento projekt:
+1. `small` (1 vrstva): rychlý test 50 epoch — ověří, zda física decay funguje
+2. `medium` (2 vrstvy): produkční trénování pro bass instrument
+3. Pokud `medium` plateau < 100 ep → zvážit `large` nebo custom preset
+
+Přidání vrstvy GRU je zpětně nekompatibilní (nový checkpoint), ale levné —
+stejný dataset, stejná pipeline, jen nová architektura.
+
+---
+
 ## Přehled stavu
 
 | Branch / Fáze | Stav | Klíčová změna |
@@ -244,10 +290,10 @@ Smysluplné až po adaptivním frame rate nebo solo pro basy (80 ms attack = 16 
 | dev-noise-fft | ✓ hotovo | NOISE_FFT 1024, harmonic-relative warping |
 | dev-adaptive-nharm | ✓ hotovo | N_HARM_MAX=128, adaptivní n_active |
 | bass-refactor Phase 0 | ✓ hotovo | framework, crop_frames(midi) 10s pro basy |
-| bass-refactor Phase 1 | ✓ hotovo | per-parciální σ_k decay |
-| bass-refactor Phase 2 | ✓ hotovo | dvousložkový decay, zig-zag polarizace |
+| bass-refactor Phase 1+2 | ✓ hotovo | dvousložkový physics decay, zig-zag polarizace |
 | dev-attack-loss | ○ připraven | _attack_weight připraven, přidat do smyčky |
 | bass-refactor Phase 3 | ○ plánováno | phantom partials (N_PHANTOM dedik. oscilátorů) |
 | dev-unison-spread | ○ plánováno | fyzikální rozladění strun (nízká priorita) |
 | dev-frame-rate | ○ čeká na HW | adaptivní frame rate (M5 / GPU) |
 | biphasní hammer | ○ future | dvoupulsový attack modeling |
+| progressive depth | ○ future | GRU layers++ po dosažení plateau |
