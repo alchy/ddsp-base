@@ -503,7 +503,8 @@ def cmd_learn(args):
         print(f'[ddsp learn]  Coupled mode: env_mix={env_mix:.0%}  '
               f'(n_env={env_model.n_env}  warp={env_model._warp})')
 
-    dataset = SourceDataset(ws.extracts_dir, min_voiced=args.min_voiced)
+    dataset = SourceDataset(ws.extracts_dir, min_voiced=args.min_voiced,
+                            max_crop=args.max_crop)
     n_val   = max(1, int(len(dataset) * 0.08))
     n_train = len(dataset) - n_val
     train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
@@ -1043,6 +1044,11 @@ def main():
     p_lrn.add_argument('--resume',     action='store_true',
                        help='Continue from last checkpoint')
     p_lrn.add_argument('--batch-size', type=int,   default=4, dest='batch_size')
+    p_lrn.add_argument('--max-crop', type=int, default=None, dest='max_crop',
+                       metavar='FRAMES',
+                       help='Hard cap on adaptive crop length. Use 50 on CPU to keep '
+                            'epochs fast (avoids (B,128,n_samples) tensors for bass). '
+                            'Leave unset on GPU for full adaptive window.')
     p_lrn.add_argument('--min-voiced', type=float, default=0.1, dest='min_voiced',
                        help='Minimum voiced frame fraction per window (default: 0.1)')
     p_lrn.add_argument('--coupled', action='store_true',

@@ -57,7 +57,14 @@ class SourceDataset(Dataset):
     Filename convention:  mXXX-velY-fXX.npz  (parsed for MIDI note).
     """
 
-    def __init__(self, extracts_dir: str, min_voiced: float = 0.1):
+    def __init__(self, extracts_dir: str, min_voiced: float = 0.1,
+                 max_crop: int | None = None):
+        """
+        max_crop : hard cap on crop_frames(midi) — useful for CPU training where
+                   large bass crops (800 frames × 128 harmonics × 192k samples)
+                   cause prohibitively slow epochs. Set to 50 on CPU, leave None
+                   on GPU to use the full adaptive window.
+        """
         from audio_io import parse_filename
         self.hop   = FRAME_HOP
         self.items = []     # list of (file_index, start_frame, crop_len)
@@ -83,6 +90,8 @@ class SourceDataset(Dataset):
             self.midi_per_file.append(midi)
 
             crop = crop_frames(midi)
+            if max_crop is not None:
+                crop = min(crop, max_crop)
             T    = len(d['f0'])
             if T < crop + 1:
                 continue
@@ -97,6 +106,8 @@ class SourceDataset(Dataset):
             for fi, d in enumerate(self.data):
                 midi = self.midi_per_file[fi]
                 crop = crop_frames(midi)
+                if max_crop is not None:
+                    crop = min(crop, max_crop)
                 T    = len(d['f0'])
                 for start in range(0, T - crop, max(1, crop // 4)):
                     self.items.append((fi, start, crop))
