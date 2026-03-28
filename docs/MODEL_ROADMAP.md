@@ -237,47 +237,56 @@ Smysluplné až po adaptivním frame rate nebo solo pro basy (80 ms attack = 16 
 
 ## Kapacita modelu — analýza po Phase 0–2
 
+Projekt je určen výhradně pro **Grand Piano** (88 not, 8 velocity vrstev).
+Piano je extrémně komplexní nástroj přes celý rozsah klávesnice:
+inharmonicita, decay, noise textura a spektrální balance se dramaticky mění
+od A0 (wound bass strings) po C8 (thin treble strings). Model musí obsáhnout vše najednou.
+
 ### Parametrické složení
 
 | Složka | small | medium | large |
 |--------|-------|--------|-------|
-| pre/post MLP | 34K | 118K | 432K |
-| GRU | 37K | 247K | 1 381K |
-| Harm heads (L+R) | 33K | 66K | 131K |
-| Noise heads (L+R) | **133K** | **264K** | **527K** |
-| Physics (b1/b3/alpha/B) | 0.8K | 1.5K | 3K |
-| **Celkem** | **238K** | **697K** | **2 475K** |
+| pre/post MLP | 118K | 432K | 563K |
+| GRU | 148K | 986K | 3 152K |
+| Harm heads (L+R) | 66K | 131K | 131K |
+| Noise heads (L+R) | **264K** | **527K** | **527K** |
+| Physics (b1/b3/alpha/B) | 1.5K | 3K | 3K |
+| **Celkem** | **598K** | **2 081K** | **4 377K** |
 
-### Upozornění: small + Phase 0 (dlouhé sekvence)
+Noise heads plateau při mlp_dim=512 — při přechodu medium→large roste jen GRU.
 
-Phase 0 dává A0 notám okno 2000 framů (10 s). `small` model má:
-- 1-vrstvý GRU, hidden=64
-- Gradient přes 2000 kroků v mělkém GRU je náchylný k úniku/zániku
-- Výsledek: model se nenaučí dlouhodobé decay vzory, přestože trénovací okno je dostatečné
+### Doporučení pro piano
 
-**Doporučení**: pro nástroje s basovým registrem používat `medium` jako výchozí
-(2-vrstvý GRU, hidden=128). `small` ponechat pro rychlé diagnostické trénování (50 epoch).
+**`small` (598K, 1-vrstvý GRU)**: diagnostika a rychlé testy (50 epoch).
+Dostatečné pro ověření konvergence physics decay, ale nedostačující pro
+produkci — 1 vrstva GRU nezachytí plnou komplexitu 88 not × 8 velocity.
+
+**`medium` (2.1M, 2-vrstvý GRU)**: doporučený default pro piano.
+GRU tvoří 47 % parametrů — správně vyvážený model. 2 vrstvy lépe zachytí
+registrové přechody (bass→mid→treble) a long-term dependencies
+bassového registru (Phase 0: 2000 framů = 10s okno pro A0).
+
+**`large` (4.4M, 2-vrstvý GRU/512 hidden)**: nejlepší kvalita; GPU doporučeno.
+Noise heads plateau na 527K (mlp_dim=512) — přidaná kapacita jde výhradně do GRU.
+Na CPU velmi pomalé, ale výsledky nejlepší pro celý rozsah 88 not.
 
 ### Nevyváženost noise vs GRU (small model)
 
-`small`: noise heads 133K vs GRU 37K — síť má 3.6× více kapacity pro tvar šumu
-než pro dynamiku. Po Phase 2 (physics decay) je GRU méně zatížen, ale tato nevyváženost
-zůstává nevhodná pokud je cílem naučit se jemné registrové rozdíly barvy.
+`small`: noise heads 133K vs GRU 37K — 3.6× více kapacity pro tvar šumu než pro dynamiku.
+Nevhodné pro piano, kde je GRU klíčový (musí zobecnit přes 88 not × 8 velocity).
+Zvážit v budoucnosti: sdílené L/R noise head nebo N_NOISE konfigurovatelné per preset.
 
-Zvážit v budoucnosti: konfigurovatelné N_NOISE per model size (nebo sdílené L/R noise head).
+### Strategie postupného zvyšování hloubky (progressive depth)
 
-### Strategie postupného zvyšování hloubky
+Analogie z ML praxe: trénovat do plateau val loss, pak přidat vrstvu GRU.
 
-Analogie z ML praxe: trénovat na daném hardware do dosažení plateau val loss,
-pak přidat vrstvu GRU (gru_layers += 1) nebo zvýšit hidden.
+Pro toto piano:
+1. `small`, 50 epoch → ověří, zda physics decay konverguje (diagnostika)
+2. `medium`, 100–300 epoch → produkční trénování
+3. Pokud `medium` plateau nastane velmi brzy → `large` nebo custom preset (gru_layers=4)
 
-Konkrétně pro tento projekt:
-1. `small` (1 vrstva): rychlý test 50 epoch — ověří, zda física decay funguje
-2. `medium` (2 vrstvy): produkční trénování pro bass instrument
-3. Pokud `medium` plateau < 100 ep → zvážit `large` nebo custom preset
-
-Přidání vrstvy GRU je zpětně nekompatibilní (nový checkpoint), ale levné —
-stejný dataset, stejná pipeline, jen nová architektura.
+Přidání vrstvy GRU je checkpointově nekompatibilní, ale jinak levné —
+stejný dataset, stejná pipeline.
 
 ---
 

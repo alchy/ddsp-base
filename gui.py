@@ -356,9 +356,9 @@ def build_ui():
 
                 with gr.Row():
                     model_size = gr.Dropdown(
-                        ['small', 'medium', 'large'], value='small',
+                        ['small', 'medium', 'large'], value='medium',
                         label='Velikost modelu',
-                        info='small ~238K param (rychle CPU), medium ~696K, large ~3.4M'
+                        info='small ~598K (diagnostika), medium ~2.1M (doporuceno pro piano), large ~4.4M (produkce, GPU)'
                     )
                     epochs_sl  = gr.Slider(10, 500, value=100, step=10,
                                            label='Pocet epoch',

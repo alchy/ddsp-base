@@ -20,8 +20,20 @@ F0_BINS = 64
 LO_DIM  = 16
 VEL_DIM = 8
 
+# Model size presets — optimized for Grand Piano (88 notes × 8 velocity layers)
+#
+# small  (~598K):  quick diagnostics / first-run test (50 epochs)
+#                  1-layer GRU, mlp_dim=256
+#
+# medium (~2.08M): recommended default for piano production
+#                  2-layer GRU (handles long bass sequences from Phase 0),
+#                  GRU dominates (47% of total) — correct balance for piano
+#
+# large  (~4.4M):  best quality; 2-layer GRU with 512 hidden
+#                  GPU recommended (CPU very slow)
+#                  noise heads plateau at mlp_dim=512 — GRU is the differentiator
 MODEL_SIZES = {
-    'small':  dict(gru_hidden=64,  gru_layers=1, mlp_dim=128),   # ~84 K params
-    'medium': dict(gru_hidden=128, gru_layers=2, mlp_dim=256),   # ~400 K params
-    'large':  dict(gru_hidden=256, gru_layers=3, mlp_dim=512),   # ~1.9 M params
+    'small':  dict(gru_hidden=128, gru_layers=1, mlp_dim=256),
+    'medium': dict(gru_hidden=256, gru_layers=2, mlp_dim=512),
+    'large':  dict(gru_hidden=512, gru_layers=2, mlp_dim=512),
 }

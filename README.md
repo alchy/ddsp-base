@@ -170,11 +170,14 @@ Log se aktualizuje každé 2 sekundy. Tlačítko Stop přeruší běh příkazu.
 
 ## Velikosti modelu
 
-| Preset | Parametry | Popis |
-|--------|-----------|-------|
-| `small` | ~238 K | Rychlé CPU trénování, základní kvalita |
-| `medium` | ~697 K | Doporučený výchozí |
-| `large` | ~2.5 M | Nejlepší kvalita, pomalejší na CPU |
+Projekt je určen pro Grand Piano (88 not × 8 velocity vrstev). Piano pokrývá
+extrémně široký rozsah — `small` slouží jen pro diagnostiku, ne produkci.
+
+| Preset | Parametry | Doporučení |
+|--------|-----------|------------|
+| `small` | ~598 K | Rychlý test / diagnostika (50 epoch) |
+| `medium` | ~2.1 M | **Výchozí pro piano** — 2-vrstvý GRU, zvládne celý rozsah 88 not |
+| `large` | ~4.4 M | Produkční banka, nejlepší kvalita (GPU doporučeno) |
 
 ---
 
