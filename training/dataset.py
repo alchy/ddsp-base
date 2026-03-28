@@ -14,13 +14,14 @@ Adaptive window size (Phase 0 of bass refactor):
 
 from __future__ import annotations
 
+import collections
 import glob
 import os
 import random
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from synth.constants import SR, FRAME_HOP
 
@@ -138,3 +139,53 @@ class SourceDataset(Dataset):
             torch.tensor(midi,     dtype=torch.long),
             torch.tensor(start,    dtype=torch.long),
         )
+
+
+class CropBucketSampler(Sampler):
+    """Groups dataset items by crop length so every batch contains same-length tensors.
+
+    PyTorch's default collate requires equal-length tensors. SourceDataset assigns
+    different crop lengths per MIDI note (50–2000 frames), so a naïve DataLoader
+    crashes on the first mixed batch. This sampler groups items by crop size and
+    only builds batches within a group.
+
+    Works with both SourceDataset and torch.utils.data.Subset wrappers.
+    """
+
+    def __init__(self, dataset, batch_size: int, shuffle: bool = True):
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+
+        # Resolve Subset → underlying SourceDataset + global index list
+        if hasattr(dataset, 'dataset'):   # torch.utils.data.Subset
+            src        = dataset.dataset
+            global_ids = list(dataset.indices)
+        else:
+            src        = dataset
+            global_ids = list(range(len(src)))
+
+        # Bucket local indices by crop length
+        buckets: dict[int, list[int]] = collections.defaultdict(list)
+        for local_i, global_i in enumerate(global_ids):
+            _, _, crop = src.items[global_i]
+            buckets[crop].append(local_i)
+
+        self._batches: list[list[int]] = []
+        for local_indices in buckets.values():
+            if shuffle:
+                random.shuffle(local_indices)
+            for i in range(0, len(local_indices), batch_size):
+                batch = local_indices[i : i + batch_size]
+                if batch:
+                    self._batches.append(batch)
+
+        if shuffle:
+            random.shuffle(self._batches)
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self._batches)
+        return iter(self._batches)
+
+    def __len__(self):
+        return len(self._batches)

@@ -45,7 +45,7 @@ from synth.constants import SR, FRAME_HOP, F0_MAX, MODEL_SIZES
 from model.vocoder   import DDSPVocoder, build_ddsp, count_params
 from model.envelope  import EnvelopeNet, N_ENV, ENVELOPE_WARP
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
-from training.dataset import SourceDataset, crop_frames, CROP_FRAMES_MIN as CROP_FRAMES
+from training.dataset import SourceDataset, crop_frames, CropBucketSampler
 from training.loss    import mrstft_loss, _attack_weight
 
 # IthacaPlayer output root — generated sample banks land here
@@ -409,6 +409,50 @@ def cmd_extract(args):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic generation — called after each new best checkpoint
+# ---------------------------------------------------------------------------
+
+# 16 notes spread across the piano (low / mid / high), all velocity 5.
+# Files are always overwritten — only the latest best checkpoint is kept.
+_DIAG_NOTES = [
+    # Low  (A0–E2)
+    21, 24, 33, 36, 40,
+    # Mid  (A3–E5)
+    57, 60, 64, 69, 72, 76,
+    # High (A5–C7)
+    81, 84, 88, 93, 96,
+]
+_DIAG_VEL = 5
+
+@torch.no_grad()
+def _diag_generate(model: DDSPVocoder, ws, epoch: int, device):
+    """Generate a spread of notes after each new best checkpoint.
+
+    Output: checkpoints/preview/m{midi:03d}_vel{vel}.wav
+    Previous files are overwritten — only the latest best set is kept.
+    Silently skips if extracts are not ready yet.
+    """
+    templates = load_envelope_templates(ws.extracts_dir)
+    if not templates:
+        return
+    preview_dir = os.path.join(ws.checkpoints_dir, 'preview')
+    os.makedirs(preview_dir, exist_ok=True)
+    model.eval()
+    generated = 0
+    for midi in _DIAG_NOTES:
+        try:
+            loudness = find_envelope(templates, midi, _DIAG_VEL)
+            audio    = synthesize(model, midi, float(_DIAG_VEL), loudness, device)
+            name     = f'm{midi:03d}_vel{_DIAG_VEL}.wav'
+            save_wav(os.path.join(preview_dir, name), audio, SR)
+            generated += 1
+        except Exception as exc:
+            print(f'  [preview] m{midi:03d}: {exc}')
+    if generated:
+        print(f'  [preview] {generated} notes -> {preview_dir}  (ep {epoch})')
+
+
+# ---------------------------------------------------------------------------
 # Command: learn
 # ---------------------------------------------------------------------------
 
@@ -463,8 +507,10 @@ def cmd_learn(args):
     n_val   = max(1, int(len(dataset) * 0.08))
     n_train = len(dataset) - n_val
     train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_sampler = CropBucketSampler(train_ds, args.batch_size, shuffle=True)
+    val_sampler   = CropBucketSampler(val_ds,   args.batch_size, shuffle=False)
+    train_loader  = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=0)
+    val_loader    = DataLoader(val_ds,   batch_sampler=val_sampler,   num_workers=0)
 
     model    = build_ddsp(size=model_size).to(device)
     n_params = count_params(model)
@@ -501,7 +547,8 @@ def cmd_learn(args):
         Coupled mode: with probability env_mix, replace real NPZ loudness with
         EnvelopeNet prediction (sliced to the same crop window).
         """
-        lo_real = (loL + loR) * 0.5   # (B, CROP_FRAMES) from NPZ
+        lo_real   = (loL + loR) * 0.5   # (B, crop_len)
+        crop_len  = lo_real.shape[1]
         if env_model is None or random.random() >= env_mix:
             return lo_real.to(device)
         lo_list = []
@@ -510,7 +557,7 @@ def cmd_learn(args):
             vel_i   = round(float(vel_b[b].item()))
             st      = int(start_b[b].item())
             env_arr = env_model.predict_envelope(midi_i, vel_i, warp=env_model._warp)
-            end     = st + CROP_FRAMES
+            end     = st + crop_len
             if len(env_arr) >= end:
                 chunk = env_arr[st:end]
             else:
@@ -527,7 +574,7 @@ def cmd_learn(args):
             audio = audio.to(device)
             vel   = vel.to(device)
             lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
-            pred  = model(f0, lo, vel, CROP_FRAMES)
+            pred  = model(f0, lo, vel, f0.shape[1])
             aw    = _attack_weight(lo, pred.shape[-1])
             loss  = (mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
                      + 0.3 * mrstft_loss(pred * aw, audio * aw))
@@ -545,7 +592,7 @@ def cmd_learn(args):
                 audio = audio.to(device)
                 vel   = vel.to(device)
                 lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
-                pred  = model(f0, lo, vel, CROP_FRAMES)
+                pred  = model(f0, lo, vel, f0.shape[1])
                 aw    = _attack_weight(lo, pred.shape[-1])
                 val_losses.append((mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
                                    + 0.3 * mrstft_loss(pred * aw, audio * aw)).item())
@@ -558,6 +605,7 @@ def cmd_learn(args):
             best_val = vl
             torch.save({'model': model.state_dict(), 'model_size': model_size}, best_pt)
             best_tag = '  <- best'
+            _diag_generate(model, ws, epoch, device)
 
         line = (f'ep {epoch:4d}  train={tl:.4f}  val={vl:.4f}  '
                 f'lr={lr_now:.2e}  {elapsed:.1f}s{best_tag}')
