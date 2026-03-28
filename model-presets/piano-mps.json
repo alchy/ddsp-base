@@ -1,0 +1,11 @@
+{
+  "_description": "Grand Piano — Apple Silicon (M1–M5, MPS). Full adaptive window; batch size conservative to fit unified memory. Medium model recommended; switch to large on M4 Pro / M5 with 32+ GB.",
+  "_device": "mps",
+
+  "model":      "medium",
+  "epochs":     200,
+  "lr":         0.0003,
+  "batch_size": 8,
+  "max_crop":   null,
+  "min_voiced": 0.1
+}

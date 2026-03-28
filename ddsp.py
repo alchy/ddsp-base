@@ -41,7 +41,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from synth.constants import SR, FRAME_HOP, F0_MAX, MODEL_SIZES
+from synth.constants import SR, FRAME_HOP, F0_MAX, MODEL_SIZES, DEVICE_DEFAULT_PRESET
 from model.vocoder   import DDSPVocoder, build_ddsp, count_params
 from model.envelope  import EnvelopeNet, N_ENV, ENVELOPE_WARP
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
@@ -68,9 +68,11 @@ class Workspace:
     @property
     def generated_dir(self):   return os.path.join(self.work_dir, 'generated')
     @property
-    def config_path(self):     return os.path.join(self.work_dir, 'instrument.json')
+    def config_path(self):      return os.path.join(self.work_dir, 'instrument.json')
     @property
-    def log_path(self):        return os.path.join(self.work_dir, 'train.log')
+    def train_config_path(self): return os.path.join(self.work_dir, 'train.json')
+    @property
+    def log_path(self):         return os.path.join(self.work_dir, 'train.log')
     @property
     def name(self):
         return os.path.basename(os.path.normpath(self.source_dir))
@@ -116,6 +118,103 @@ def save_config(ws: Workspace, cfg: dict):
     ws.makedirs()
     with open(ws.config_path, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Preset + training configuration
+# ---------------------------------------------------------------------------
+
+_PRESETS_DIR = os.path.join(os.path.dirname(__file__), 'model-presets')
+# Keys starting with _ are metadata, not training params
+_PRESET_META_PREFIX = '_'
+
+
+def list_presets() -> list[str]:
+    """Return sorted list of available preset names (without .json extension)."""
+    if not os.path.isdir(_PRESETS_DIR):
+        return []
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(_PRESETS_DIR)
+        if f.endswith('.json') and not f.startswith('_')
+    )
+
+
+def load_preset(name: str) -> dict:
+    """Load a preset by name from model-presets/<name>.json.
+
+    Returns only the training parameter keys (strips _description etc.).
+    Raises FileNotFoundError with a helpful message if not found.
+    """
+    path = os.path.join(_PRESETS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        available = list_presets()
+        raise FileNotFoundError(
+            f'Preset "{name}" not found in {_PRESETS_DIR}.\n'
+            f'Available presets: {available}'
+        )
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if not k.startswith(_PRESET_META_PREFIX)}
+
+
+def load_train_config(ws: Workspace) -> dict:
+    """Load workspace train.json if it exists.
+
+    train.json may contain:
+        "preset": "<name>"   — override the device-auto-selected preset
+        any training param   — override individual values from the preset
+    """
+    if os.path.exists(ws.train_config_path):
+        with open(ws.train_config_path, encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_train_config(ws: Workspace, preset_name: str):
+    """Write a starter train.json pointing to the given preset."""
+    ws.makedirs()
+    data = {"preset": preset_name}
+    with open(ws.train_config_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+
+
+def resolve_train_params(device: str, ws: Workspace, cli_args) -> dict:
+    """Merge preset / train.json / CLI args into a final training parameter dict.
+
+    Priority (highest first):
+        1. Explicit CLI flags   (--model, --lr, --batch-size, --max-crop, --epochs)
+        2. workspace/train.json (can override preset or just set "preset")
+        3. model-presets/<name>.json  (auto-selected from device or train.json)
+        4. hard-coded fallback values
+
+    Returns dict with keys: model, epochs, lr, batch_size, max_crop, min_voiced,
+                             preset_name (informational).
+    """
+    # Step 1: determine preset name
+    dev_type     = ('cuda' if str(device).startswith('cuda') else
+                    'mps'  if str(device) == 'mps'          else 'cpu')
+    train_cfg    = load_train_config(ws)
+    preset_name  = (getattr(cli_args, 'preset', None)
+                    or train_cfg.get('preset')
+                    or DEVICE_DEFAULT_PRESET.get(dev_type, 'piano-cpu'))
+
+    # Step 2: load preset values
+    try:
+        params = load_preset(preset_name)
+    except FileNotFoundError as e:
+        print(f'[ddsp]  WARNING: {e}')
+        params = {'model': 'small', 'epochs': 200, 'lr': 0.0003,
+                  'batch_size': 4, 'max_crop': 50, 'min_voiced': 0.1}
+
+    # Step 3: apply train.json overrides (skip 'preset' key itself)
+    for k, v in train_cfg.items():
+        if k != 'preset':
+            params[k] = v
+
+    params['preset_name'] = preset_name
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -460,21 +559,37 @@ def cmd_learn(args):
     ws = make_workspace(args.instrument, getattr(args, "workspace", None))
     ws.makedirs()
 
+    # ------------------------------------------------------------------ #
+    # Device + preset resolution                                         #
+    # ------------------------------------------------------------------ #
+    device = resolve_device(getattr(args, 'device', 'auto'))
+    tp     = resolve_train_params(device, ws, args)   # merged preset/train.json/CLI
+
+    batch_size = tp['batch_size']
+    lr_init    = tp['lr']
+    max_crop   = tp['max_crop']
+
     cfg = load_config(ws)
     saved_size = cfg.get('model_size')
     if saved_size:
-        # instrument.json is authoritative — ignore --model to prevent size mismatch
         if args.model and args.model != saved_size:
             print(f'[ddsp learn]  WARNING: --model {args.model} ignored; '
                   f'instrument.json specifies model_size={saved_size}. '
                   f'Delete the workspace to start fresh with a different size.')
         model_size = saved_size
     else:
-        model_size = args.model or 'small'
+        model_size = tp['model']
     if model_size not in MODEL_SIZES:
         print(f'[ddsp learn] ERROR: unknown model size "{model_size}". '
               f'Choose from: {list(MODEL_SIZES)}')
         sys.exit(1)
+
+    print(f'[ddsp learn]  instrument={ws.name}  device={device}  '
+          f'preset={tp["preset_name"]}')
+    print(f'              model={model_size}  batch={batch_size}  '
+          f'max_crop={max_crop}  lr={lr_init:.0e}  epochs={tp["epochs"]}')
+    print(f'              source  -> {ws.source_dir}')
+    print(f'              work    -> {ws.work_dir}')
 
     # Auto-extract if no NPZ found
     npz_files = glob.glob(os.path.join(ws.extracts_dir, '*.npz'))
@@ -482,14 +597,9 @@ def cmd_learn(args):
         print('[ddsp learn] No extracts found -- running extraction first.')
         extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=60)
 
-    device = resolve_device(getattr(args, 'device', 'auto'))
-    print(f'[ddsp learn]  instrument={ws.name}  model={model_size}  device={device}')
-    print(f'              source  -> {ws.source_dir}')
-    print(f'              work    -> {ws.work_dir}')
-
-    # --- coupled mode: train EnvelopeNet first, then use its predictions during DDSP training ---
+    # --- coupled mode ---
     coupled   = getattr(args, 'coupled', False)
-    env_mix   = getattr(args, 'env_mix', 0.5)   # fraction of batches using EnvelopeNet loudness
+    env_mix   = getattr(args, 'env_mix', 0.5)
     env_model = None
     if coupled:
         env_pt = os.path.join(ws.checkpoints_dir, 'envelope.pt')
@@ -503,13 +613,13 @@ def cmd_learn(args):
         print(f'[ddsp learn]  Coupled mode: env_mix={env_mix:.0%}  '
               f'(n_env={env_model.n_env}  warp={env_model._warp})')
 
-    dataset = SourceDataset(ws.extracts_dir, min_voiced=args.min_voiced,
-                            max_crop=args.max_crop)
+    dataset = SourceDataset(ws.extracts_dir, min_voiced=tp['min_voiced'],
+                            max_crop=max_crop)
     n_val   = max(1, int(len(dataset) * 0.08))
     n_train = len(dataset) - n_val
     train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
-    train_sampler = CropBucketSampler(train_ds, args.batch_size, shuffle=True)
-    val_sampler   = CropBucketSampler(val_ds,   args.batch_size, shuffle=False)
+    train_sampler = CropBucketSampler(train_ds, batch_size, shuffle=True)
+    val_sampler   = CropBucketSampler(val_ds,   batch_size, shuffle=False)
     train_loader  = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=0)
     val_loader    = DataLoader(val_ds,   batch_sampler=val_sampler,   num_workers=0)
 
@@ -517,9 +627,9 @@ def cmd_learn(args):
     n_params = count_params(model)
     print(f'[ddsp learn]  params={n_params:,}  n_train={n_train}  n_val={n_val}')
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_init)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
+        optimizer, T_max=tp['epochs'], eta_min=lr_init * 0.05)
 
     start_epoch, best_val = 0, float('inf')
     last_pt = os.path.join(ws.checkpoints_dir, 'last.pt')
@@ -541,7 +651,8 @@ def cmd_learn(args):
 
     # Training log
     log_f = open(ws.log_path, 'a', buffering=1)
-    log_f.write(f'\n--- {_now()}  model={model_size}  epochs={args.epochs}  lr={args.lr} ---\n')
+    log_f.write(f'\n--- {_now()}  model={model_size}  epochs={tp['epochs']}  lr={lr_init}  '
+                f'profile={dev_type}  max_crop={max_crop} ---\n')
 
     def _get_loudness(loL, loR, vel_b, midi_b, start_b):
         """Return loudness tensor for a batch.
@@ -567,7 +678,7 @@ def cmd_learn(args):
             lo_list.append(torch.from_numpy(chunk))
         return torch.stack(lo_list).to(device)
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    for epoch in range(start_epoch, start_epoch + tp['epochs']):
         model.train()
         t0, train_losses = time.time(), []
         for f0, loL, loR, vp, audio, vel, midi_b, start_b in train_loader:
@@ -633,7 +744,7 @@ def cmd_learn(args):
     cfg.update({'instrument': ws.name, 'source_dir': ws.source_dir,
                 'model_size': model_size, 'sr': SR,
                 'training': {
-                    'epochs_completed': start_epoch + args.epochs,
+                    'epochs_completed': start_epoch + tp['epochs'],
                     'best_val': best_val,
                     'last_trained': _now(),
                 }})
@@ -1035,28 +1146,16 @@ def main():
 
     # --- learn ---
     p_lrn = subs.add_parser('learn', help='Train model (runs extract if needed)')
-    p_lrn.add_argument('--instrument', required=True, metavar='DIR')
+    p_lrn.add_argument('--instrument', required=True, metavar='DIR',
+                       help='Path to the instrument sample bank directory')
     p_lrn.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
-    p_lrn.add_argument('--model', choices=list(MODEL_SIZES), default=None,
-                       help='Model size: small (~115K), medium (~452K), large (~1.99M)')
-    p_lrn.add_argument('--epochs',     type=int,   default=100)
-    p_lrn.add_argument('--lr',         type=float, default=3e-4)
-    p_lrn.add_argument('--resume',     action='store_true',
-                       help='Continue from last checkpoint')
-    p_lrn.add_argument('--batch-size', type=int,   default=4, dest='batch_size')
-    p_lrn.add_argument('--max-crop', type=int, default=None, dest='max_crop',
-                       metavar='FRAMES',
-                       help='Hard cap on adaptive crop length. Use 50 on CPU to keep '
-                            'epochs fast (avoids (B,128,n_samples) tensors for bass). '
-                            'Leave unset on GPU for full adaptive window.')
-    p_lrn.add_argument('--min-voiced', type=float, default=0.1, dest='min_voiced',
-                       help='Minimum voiced frame fraction per window (default: 0.1)')
-    p_lrn.add_argument('--coupled', action='store_true',
-                       help='Coupled mode: train EnvelopeNet first, then use its loudness '
-                            'predictions during DDSP training (aligns train/inference distributions)')
-    p_lrn.add_argument('--env-mix', type=float, default=0.5, dest='env_mix',
-                       help='Fraction of training batches using EnvelopeNet loudness in '
-                            'coupled mode (default: 0.5)')
+    p_lrn.add_argument('--preset', default=None, metavar='NAME',
+                       help=f'Training preset from model-presets/<name>.json. '
+                            f'Auto-detected from device if not set. '
+                            f'Available: {list_presets()}. '
+                            f'Fine-tune individual params via workspace/train.json.')
+    p_lrn.add_argument('--resume', action='store_true',
+                       help='Continue training from the last checkpoint')
     p_lrn.add_argument('--device', default='auto',
                        choices=['auto', 'cpu', 'mps', 'cuda'],
                        help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')

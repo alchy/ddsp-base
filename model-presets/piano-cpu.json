@@ -1,0 +1,11 @@
+{
+  "_description": "Grand Piano — CPU training. Short windows (50 fr = 0.25 s) keep (B, 128, n_samples) tensors small enough for practical epoch times. Use for architecture tests and initial convergence checks.",
+  "_device": "cpu",
+
+  "model":      "small",
+  "epochs":     200,
+  "lr":         0.0003,
+  "batch_size": 4,
+  "max_crop":   50,
+  "min_voiced": 0.1
+}

@@ -37,3 +37,15 @@ MODEL_SIZES = {
     'medium': dict(gru_hidden=256, gru_layers=2, mlp_dim=512),
     'large':  dict(gru_hidden=512, gru_layers=2, mlp_dim=512),
 }
+
+# ---------------------------------------------------------------------------
+# Device → default preset mapping
+#
+# Preset files live in  model-presets/<name>.json  (project root).
+# Users can add their own presets and select with  --preset <name>.
+# ---------------------------------------------------------------------------
+DEVICE_DEFAULT_PRESET = {
+    'cpu':  'piano-cpu',
+    'cuda': 'piano-cuda',
+    'mps':  'piano-mps',
+}

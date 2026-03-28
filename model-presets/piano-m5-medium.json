@@ -1,0 +1,12 @@
+{
+  "_description": "Grand Piano — Apple M5, medium model variant. Use when large model is too slow or for intermediate training diagnostics before committing to the full large run.",
+  "_device": "mps",
+  "_hardware": "Apple M5, 24 GB, 10 GPU cores",
+
+  "model":      "medium",
+  "epochs":     500,
+  "lr":         0.0003,
+  "batch_size": 16,
+  "max_crop":   null,
+  "min_voiced": 0.1
+}

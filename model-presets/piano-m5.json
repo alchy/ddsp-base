@@ -1,0 +1,12 @@
+{
+  "_description": "Grand Piano — Apple M5 (24 GB unified memory, 10 GPU cores). Large model, full adaptive window, extended training. Time is not a constraint — this preset prioritises quality over speed.",
+  "_device": "mps",
+  "_hardware": "Apple M5, 24 GB, 10 GPU cores",
+
+  "model":      "large",
+  "epochs":     1000,
+  "lr":         0.0003,
+  "batch_size": 16,
+  "max_crop":   null,
+  "min_voiced": 0.1
+}
