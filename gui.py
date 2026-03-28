@@ -19,8 +19,28 @@ import argparse
 
 import gradio as gr
 
-PYTHON = sys.executable
+PYTHON      = sys.executable
 ITHACA_ROOT = os.environ.get('ITHACA_ROOT', r'C:\SoundBanks\IthacaPlayer')
+_BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+_PRESETS_DIR = os.path.join(_BASE_DIR, 'model-presets')
+
+
+def _list_presets() -> list[str]:
+    if not os.path.isdir(_PRESETS_DIR):
+        return []
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(_PRESETS_DIR)
+        if f.endswith('.json') and not f.startswith('_')
+    )
+
+
+def _read_preset(name: str) -> str:
+    path = os.path.join(_PRESETS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        return f'(preset {name} nenalezen)'
+    with open(path, encoding='utf-8') as f:
+        return f.read()
 
 
 def _run_ddsp(args_list: list, log_queue: list, stop_event: threading.Event):
@@ -312,12 +332,11 @@ def build_ui():
             with gr.Tab('DDSP Model'):
                 gr.Markdown(
                     '### Trenovani DDSP modelu\n'
-                    '**Decoupled timbre architektura**: sit se uci POUZE timbre (overtone balance, '
-                    'barvu zvuku) z F0 a velocity — bez hlasitosti. Hlasitostní obalka se aplikuje '
-                    'az po synteze jako linearni multiplikator (dB → linear scale).\n\n'
-                    'Tato architektura oddeluje "jak nastroj zní" od "jak hlasity je" — model se '
-                    'naucí cistou barvu zvuku nezavislou na dynamice. '
-                    'Extrakce probehne automaticky pokud chybi.'
+                    'Veskera nastaveni (model, epochy, lr, batch…) jsou v **presetu** '
+                    '(`model-presets/<name>.json`). Preset se automaticky vybere dle zarizeni '
+                    '(cpu → `piano-cpu`, cuda → `piano-cuda`, mps → `piano-m5`).\n\n'
+                    'Pro prepisani jednotlivych hodnot bez zmeny presetu vytvor '
+                    '`<workspace>/train.json`.'
                 )
                 ddsp_status_out   = gr.Textbox(label='Stav modelu', lines=2,
                                                interactive=False, max_lines=2)
@@ -330,18 +349,17 @@ def build_ui():
                     best_pt  = os.path.join(work_dir, 'checkpoints', 'best.pt')
                     cfg_path = os.path.join(work_dir, 'instrument.json')
                     if not os.path.exists(best_pt):
-                        return 'Nenatrenovano — checkpoint neexistuje.'
+                        return 'Nenatrenovano — best.pt neexistuje.'
                     trn = {}
                     if os.path.exists(cfg_path):
                         with open(cfg_path, encoding='utf-8') as f:
                             trn = json.load(f).get('training', {})
-                    size   = trn.get('model_size') or json.load(open(cfg_path, encoding='utf-8')).get('model_size', '?') if os.path.exists(cfg_path) else '?'
-                    ep     = trn.get('epochs_completed', '?')
-                    bv     = trn.get('best_val', '?')
-                    ts     = trn.get('last_trained', '')
-                    mb     = os.path.getsize(best_pt) / 1e6
-                    return (f'HOTOVO  model={size}  ep={ep}  best_val={bv}  '
-                            f'[{ts}]\n'
+                    size = trn.get('model_size', '?')
+                    ep   = trn.get('epochs_completed', '?')
+                    bv   = trn.get('best_val', '?')
+                    ts   = trn.get('last_trained', '')
+                    mb   = os.path.getsize(best_pt) / 1e6
+                    return (f'HOTOVO  model={size}  ep={ep}  best_val={bv}  [{ts}]\n'
                             f'checkpoint: {best_pt}  ({mb:.1f} MB)')
 
                 ddsp_status_timer.tick(fn=read_ddsp_status,
@@ -354,22 +372,44 @@ def build_ui():
                                     inputs=[instrument_in, workspace_in],
                                     outputs=ddsp_status_out)
 
+                # Preset výběr
                 with gr.Row():
-                    model_size = gr.Dropdown(
-                        ['small', 'medium', 'large'], value='medium',
-                        label='Velikost modelu',
-                        info='small ~598K (diagnostika), medium ~2.1M (doporuceno pro piano), large ~4.4M (produkce, GPU)'
+                    preset_dd = gr.Dropdown(
+                        choices=['auto (dle zarizeni)'] + _list_presets(),
+                        value='auto (dle zarizeni)',
+                        label='Training preset',
+                        info='Nastaveni z model-presets/<name>.json. '
+                             '"auto" = vybere se dle zarizeni (cpu→piano-cpu, cuda→piano-cuda, mps→piano-m5). '
+                             'Edituj JSON soubor pro zmenu parametru.',
+                        scale=2,
                     )
-                    epochs_sl  = gr.Slider(10, 500, value=100, step=10,
-                                           label='Pocet epoch',
-                                           info='1 epocha ≈ 6-18 min CPU, dle velikosti modelu')
-                    lr_sl      = gr.Slider(1e-5, 1e-3, value=3e-4, step=1e-5,
-                                           label='Learning rate',
-                                           info='Doporuceno: 3e-4; sniz pokud loss osciluje')
-                resume_chk = gr.Checkbox(
-                    label='Pokracovat od posledniho checkpointu (--resume)',
-                    info='Pouzij po preruseni tréninku — zachova natrenovane vahy'
+                    resume_chk = gr.Checkbox(
+                        label='--resume (pokracovat od last.pt)',
+                        info='Po preruseni tréninku. Zachova natrenovane vahy.',
+                        scale=1,
+                    )
+
+                preset_content_out = gr.Textbox(
+                    label='Obsah presetu (pro editaci otevri model-presets/<name>.json)',
+                    lines=8, interactive=False,
                 )
+
+                # train.json (přepisy presetu)
+                with gr.Accordion('train.json — volitelne prepisani hodnot presetu', open=False):
+                    gr.Markdown(
+                        'Vytvor `<workspace>/train.json` pro prepisani jednotlivych hodnot bez zmeny presetu.\n'
+                        'Priklad: `{"epochs": 500, "lr": 0.0001}` — ostatni hodnoty se vezmou z presetu.'
+                    )
+                    train_json_edit = gr.Textbox(
+                        label='train.json (uloz tlacitkem)',
+                        lines=6, interactive=True,
+                        placeholder='{\n  "preset": "piano-cuda",\n  "epochs": 500\n}',
+                    )
+                    with gr.Row():
+                        save_train_json_btn  = gr.Button('Ulozit train.json', size='sm')
+                        load_train_json_btn  = gr.Button('Nacist train.json', size='sm')
+                    train_json_status = gr.Textbox(label='', lines=1, interactive=False)
+
                 lrn_cmd_out = gr.Textbox(label='Sestaveny prikaz', interactive=False, lines=2)
                 with gr.Row():
                     lrn_run  = gr.Button('Spustit uceni', variant='primary')
@@ -382,15 +422,22 @@ def build_ui():
                                             interactive=False, max_lines=12)
                 trainlog_timer = gr.Timer(value=3)
 
-                def run_learn(instrument, workspace, size, epochs, lr, resume, device):
+                def on_preset_change(preset_name):
+                    if preset_name == 'auto (dle zarizeni)':
+                        names = _list_presets()
+                        return '(obsah se urcí automaticky dle zarizeni pri spusteni)\n\nDostupne presety: ' + ', '.join(names)
+                    return _read_preset(preset_name)
+
+                def run_learn(instrument, workspace, preset_name, resume, device):
                     if not instrument:
                         return '', 'Zadejte adresar nastroje na zalozce "Nastroj & Stav".'
-                    args = ['learn', '--instrument', instrument,
-                            '--model', size, '--epochs', str(int(epochs)),
-                            '--lr', f'{lr:.2e}',
-                            '--device', device]
-                    if (workspace or '').strip(): args += ['--workspace', (workspace or '').strip()]
-                    if resume:  args.append('--resume')
+                    args = ['learn', '--instrument', instrument, '--device', device]
+                    if (workspace or '').strip():
+                        args += ['--workspace', (workspace or '').strip()]
+                    if preset_name and preset_name != 'auto (dle zarizeni)':
+                        args += ['--preset', preset_name]
+                    if resume:
+                        args.append('--resume')
                     cmd_str = 'python ddsp.py ' + ' '.join(args)
                     return cmd_str, run_command(args, lrn_log)
 
@@ -400,12 +447,36 @@ def build_ui():
                     if not os.path.exists(log_path):
                         return '(train.log nenalezen)'
                     with open(log_path, encoding='utf-8', errors='replace') as f:
-                        lines = f.readlines()
-                    return ''.join(lines[-60:])
+                        return ''.join(f.readlines()[-60:])
 
+                def save_train_json(instrument, workspace, content):
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    if not work_dir:
+                        return 'Zadejte adresar nastroje.'
+                    os.makedirs(os.path.join(work_dir), exist_ok=True)
+                    path = os.path.join(work_dir, 'train.json')
+                    try:
+                        json.loads(content)  # validate JSON
+                        with open(path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        return f'Ulozeno: {path}'
+                    except json.JSONDecodeError as e:
+                        return f'Chyba JSON: {e}'
+
+                def load_train_json(instrument, workspace):
+                    work_dir = (workspace or '').strip() or ((instrument or '').rstrip('/\\') + '-ddsp')
+                    path     = os.path.join(work_dir, 'train.json')
+                    if not os.path.exists(path):
+                        return '(train.json neexistuje)', 'Soubor nenalezen.'
+                    with open(path, encoding='utf-8') as f:
+                        content = f.read()
+                    return content, f'Nacteno: {path}'
+
+                preset_dd.change(fn=on_preset_change, inputs=[preset_dd],
+                                 outputs=[preset_content_out])
                 lrn_run.click(fn=run_learn,
-                               inputs=[instrument_in, workspace_in, model_size,
-                                       epochs_sl, lr_sl, resume_chk, device_dd],
+                               inputs=[instrument_in, workspace_in, preset_dd,
+                                       resume_chk, device_dd],
                                outputs=[lrn_cmd_out, lrn_log])
                 lrn_stop.click(fn=stop_command, outputs=lrn_log)
                 lrn_timer.tick(fn=poll_log, outputs=lrn_log)
@@ -418,6 +489,12 @@ def build_ui():
                 workspace_in.change(fn=read_train_log,
                                     inputs=[instrument_in, workspace_in],
                                     outputs=trainlog_out)
+                save_train_json_btn.click(fn=save_train_json,
+                                          inputs=[instrument_in, workspace_in, train_json_edit],
+                                          outputs=[train_json_status])
+                load_train_json_btn.click(fn=load_train_json,
+                                          inputs=[instrument_in, workspace_in],
+                                          outputs=[train_json_edit, train_json_status])
 
             # -- Tab: Generovani --
             with gr.Tab('Generovani'):
