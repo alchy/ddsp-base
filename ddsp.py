@@ -41,11 +41,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model_ddsp import (
-    build_ddsp, count_params, FRAME_HOP, SR, F0_MAX,
-    DDSPVocoder, MODEL_SIZES,
-    EnvelopeNet, N_ENV, ENVELOPE_WARP,
-)
+from synth.constants import SR, FRAME_HOP, F0_MAX, MODEL_SIZES
+from model.vocoder   import DDSPVocoder, build_ddsp, count_params
+from model.envelope  import EnvelopeNet, N_ENV, ENVELOPE_WARP
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
 from training.dataset import SourceDataset, crop_frames, CROP_FRAMES_MIN as CROP_FRAMES
 from training.loss    import mrstft_loss, _attack_weight

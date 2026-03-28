@@ -9,6 +9,11 @@ Architecture (Decoupled Timbre):
 
 Loudness is applied as a linear envelope after synthesis so the network
 learns pure timbre independently of dynamics.
+
+Per-partial physics decay (Phase 1 — bass refactor):
+    σ_k = b1 + b3 · (2π · k · f0_mean)²     [Simionato 2024, Bensa 2003]
+    b1, b3 are learned scalars pooled over T (note-level constants).
+    Init: b1 ≈ 0.31 s⁻¹,  b3 ≈ 1.1e-7  (close to Steinway D values).
 """
 
 import math
@@ -29,8 +34,7 @@ class DDSPVocoder(nn.Module):
     Fully stereo DDSP vocoder conditioned on (F0, loudness, velocity).
 
     Independent harmonic and noise parameters for L and R channels
-    allow the network to capture spatial timbre differences (mic placement,
-    soundboard directionality, etc.).
+    allow the network to capture spatial timbre differences.
 
     Returns: (B, 2, n_samples)
     """
@@ -66,6 +70,15 @@ class DDSPVocoder(nn.Module):
         # init bias=-5 → sigmoid≈0.007 → B≈0 at start
         self.head_B = nn.Linear(mlp_dim, 1)
         nn.init.constant_(self.head_B.bias, -5.0)
+
+        # Per-partial physics decay: σ_k = b1 + b3 · (2π · k · f0)²
+        # Pooled over T — note-level constants (physics: decay rate doesn't vary per frame)
+        # b1 init: softplus(-1.0) ≈ 0.31 s⁻¹  (Steinway D: ~0.3)
+        # b3 init: softplus(-16.0) ≈ 1.1e-7    (Steinway D: ~1e-7)
+        self.head_b1 = nn.Linear(mlp_dim, 1)
+        self.head_b3 = nn.Linear(mlp_dim, 1)
+        nn.init.constant_(self.head_b1.bias, -1.0)
+        nn.init.constant_(self.head_b3.bias, -16.0)
 
         self.harm_synth  = HarmonicSynth()
         self.noise_synth = NoiseSynth()
@@ -120,10 +133,14 @@ class DDSPVocoder(nn.Module):
         inh      = torch.sigmoid(self.head_B(feat)).squeeze(-1).mean(dim=1) \
                    * b_max * inh_scale
 
+        # Per-partial physics decay (note-level scalars pooled over T)
+        b1 = F.softplus(self.head_b1(feat)).squeeze(-1).mean(dim=1)  # (B,)
+        b3 = F.softplus(self.head_b3(feat)).squeeze(-1).mean(dim=1)  # (B,)
+
         # Synthesis
         n_samples   = n_frames * FRAME_HOP
-        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh)
-        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh=inh)
+        harmonic_L  = self.harm_synth(harm_amps_L, f0_hz, n_samples, inh=inh, b1=b1, b3=b3)
+        harmonic_R  = self.harm_synth(harm_amps_R, f0_hz, n_samples, inh=inh, b1=b1, b3=b3)
         noise_sig_L = self.noise_synth(noise_L, f0_hz, n_samples)
         noise_sig_R = self.noise_synth(noise_R, f0_hz, n_samples)
 
