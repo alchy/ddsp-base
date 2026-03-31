@@ -1,0 +1,11 @@
+{
+  "_description": "Grand Piano — CUDA GPU training. Full adaptive window (up to 800 frames = 4 s for bass notes) captures two-component decay. Medium model is the recommended production default.",
+  "_device": "cuda",
+
+  "model":      "medium",
+  "epochs":     200,
+  "lr":         0.0003,
+  "batch_size": 16,
+  "max_crop":   null,
+  "min_voiced": 0.1
+}

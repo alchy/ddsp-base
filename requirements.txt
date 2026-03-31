@@ -1,5 +1,12 @@
-torch>=2.0.0
-numpy>=1.24
+# DDSP Neural Vocoder — ověřené závislosti
+# Testováno: Python 3.13.9, Windows 10 Pro
+# PyTorch 2.3+ plně podporuje Python 3.13 — žádná speciální instalace nutná
+
+torch>=2.3.0
+numpy>=2.0
 librosa>=0.10
 soundfile>=0.12
-gradio>=4.0
+gradio>=5.0
+
+# PDF extrakce (pro analýzu papers)
+pymupdf>=1.24

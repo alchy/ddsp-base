@@ -1,351 +1,240 @@
 # DDSP Neural Vocoder
 
-DDSP Neural Vocoder se naučí timbre monofónního nástroje z WAV vzorků
-a syntetizuje nové vzorky podmíněné trojicí (F0, hlasitost, velocity).
-Výstupem je stereo WAV banka kompatibilní se samplerovými pluginy (Kontakt, sfz).
+Naučí timbre Grand Piana z WAV vzorků a syntetizuje stereo WAV banku
+kompatibilní se samplerovými pluginy (IthacaPlayer, Kontakt, SFZ).
 
-Závislosti: Python 3.10+, PyTorch ≥ 2.0, librosa ≥ 0.10, soundfile ≥ 0.12.
-GPU není nutné — model `small` trénuje na CPU za přijatelnou dobu.
+Technická architektura a roadmap jsou v `docs/`.
 
 ---
 
-## Jak to funguje?
+## Požadavky
 
-Vstupem jsou monofónní WAV soubory pojmenované ve formátu `mXXX-velY-f48.wav`
-(MIDI nota, velocity vrstva, vzorkovací frekvence). Model se naučí mapovat
-trojici (F0, loudness, velocity) na spektrální obálku nástroje.
-
-```
-Zdrojove WAV soubory
-        |
-        v  extract -- pyin F0, RMS loudness, velocity
-        |
-NPZ cache (extracts/*.npz)
-        |
-        v  learn -- DDSP trenovani (MRSTFT loss + L1)
-        |
-best.pt checkpoint
-        |
-        v  generate -- inference pro kazdy WAV ze zdroje
-        |
-Generovane WAV soubory (<nastroj>-ddsp/generated/)
-```
-
-Signalovy model:
-
-```
-audio(t) = SUM_k [ a_k(t) * sin(2*pi * k * F0(t) * t / SR) ]   // harmonicke oscilatory
-         + ISTFT( STFT(white_noise) * mag_spectrum(t) )          // tvarovany sum
-```
-
-Neuronova sit predikuje amplitudy `a_k` a `mag_spectrum` pro kazdy 5ms ramec.
-Podrobna architektura je v `docs/ARCHITECTURE.md`.
-
----
-
-## Adresarova struktura
-
-```
-C:\SoundBanks\
-  ddsp\
-    <nastroj>\          <- zdrojove WAV soubory (READ-ONLY vstup pro trenovani)
-  SFZ\
-    <nastroj>\          <- puvodni SFZ banky (READ-ONLY)
-  IthacaPlayer\
-    <nastroj>\          <- vygenerovane vzorky (vystup, prehrava IthacaPlayer)
-
-<nastroj>-ddsp\         <- workspace (vedlejsi data, vedle zdroje)
-  extracts\             <- NPZ cache
-  checkpoints\          <- best.pt, last.pt
-  instrument.json
-  train.log
-```
-
-Zdrojovy adresar je nikdy nemodifikovan. Workspace lze predat parametrem
-`--workspace <cesta>` — uzitecne pokud se zdroj presunul, ale extracts/checkpoints
-zustaly na puvodnim miste.
-
----
-
-## Rychly start
-
-Tri prikazy pro prvni pouziti:
-
-```bash
-# 1. Instalace zavislosti
-pip install -r requirements.txt
-
-# 2. Extrakce priznaku ze zdrojovych WAV
-python ddsp.py extract --instrument C:\SoundBanks\ddsp\vintage-vibe
-
-# 3. Trenovani (auto-spusti extrakci pokud chybi)
-python ddsp.py learn --instrument C:\SoundBanks\ddsp\vintage-vibe --model small --epochs 100
-
-# 4. Generovani vzorku -> automaticky do C:\SoundBanks\IthacaPlayer\vintage-vibe\
-python ddsp.py generate --instrument C:\SoundBanks\ddsp\vintage-vibe
-```
-
-Vysledek: `C:\SoundBanks\IthacaPlayer\vintage-vibe\` obsahuje syntezovane WAV soubory
-pripravene pro IthacaPlayer.
-
-> Tip: graficke rozhrani spustite prikazem `python gui.py`. Otevre se v prohlizeci na `http://127.0.0.1:7860`.
-
----
-
-## Krok za krokem
-
-### 1. Instalace
+- Python 3.10+
+- PyTorch ≥ 2.3 (plně podporuje Python 3.13)
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Na Windows s CUDA (volitelne pro rychlejsi trenovani):
+GPU není povinné, ale výrazně urychlí trénink. Bez GPU program automaticky
+použije preset `piano-cpu` (kratší okna, menší model).
 
+**CUDA (volitelně):**
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
 
-### 2. Priprava zdrojovych souboru
+---
 
-Zdrojovy adresar uloz do `C:\SoundBanks\ddsp\<jmeno-nastroje>\`.
-Doporuceny format nazvu souboru:
-
-```
-m060-vel5-f48.wav     # MIDI 60 (C4), velocity vrstva 5, 48 kHz
-m060-vel7-f48.wav     # MIDI 60 (C4), velocity vrstva 7 (forte)
-```
-
-Mas-li SFZ banku (Salamander, Piano in 162 apod.), uloz ji do
-`C:\SoundBanks\SFZ\<jmeno>\` a prevez pomoci:
+## Rychlý start
 
 ```bash
-python sfz_convert.py C:\SoundBanks\SFZ\<jmeno>\*.sfz C:\SoundBanks\ddsp\<jmeno>
+# 1. Extrakce příznaků ze zdrojových WAV
+python ddsp.py extract --instrument C:\SoundBanks\ddsp\ks-grand
+
+# 2. Trénování (nastavení z presetu, auto-detekce zařízení)
+python ddsp.py learn --instrument C:\SoundBanks\ddsp\ks-grand
+
+# 3. Generování vzorků
+python ddsp.py generate --instrument C:\SoundBanks\ddsp\ks-grand
+
+# Grafické rozhraní (alternativa ke CLI)
+python gui.py
 ```
-
-> **Pozor:** zdrojovy adresar je vzdy jen ke cteni. Vsechny podporne vystupy jdou do `<nastroj>-ddsp/`.
-
-### 3. Extrakce priznaku
-
-```bash
-python ddsp.py extract --instrument <adresar> [--chunk-sec 60] [--force-pyin]
-```
-
-Prikaz pro kazdy WAV:
-- **known-F0 mod (vychozi)**: pokud nazev souboru obsahuje MIDI notu (`mXXX`), F0 se odvodi
-  primo z nazvu (<0.1 s/soubor) — extrakce celeho archivniho piana zabere sekundy misto hodin
-- **pyin mod (zaloha)**: pokud MIDI nelze parseovat, nebo je zadan `--force-pyin`, spusti se
-  pomalejsi odhad pyin (~20 s/soubor)
-- vypocita RMS loudness per kanal per ramec
-- ulozi do `<nastroj>-ddsp/extracts/*.npz`
-
-Dlouhe soubory se automaticky rozdeli na chunky (`--chunk-sec`, vychozi: 60 s).
-Uz zpracovane soubory se preskoci (lze bezpecne spustit opakovane).
-
-### 4. Trenovani
-
-```bash
-python ddsp.py learn --instrument <adresar> [--model small|medium|large] [--epochs 100] [--resume]
-```
-
-Trenovani ulozi:
-- `best.pt` — vahy s nejnizsi validacni ztrátou
-- `last.pt` — posledni stav (pro pokracovani s `--resume`)
-- `train.log` — ztrata po epochach
-
-Priblizna doba trenovani modelu `small` na CPU (100 epoch, 60s audia):
-
-| Hardware | Cas |
-|----------|-----|
-| CPU (8 jader) | 15–30 min |
-| GPU RTX 3080 | 2–5 min |
-
-### 5. Generovani
-
-```bash
-python ddsp.py generate --instrument <adresar> [--wet 1.0] [--notes C4 A3] [--vel 5 7]
-```
-
-Pro kazdy zdrojovy WAV:
-1. nacte referencni loudness obálku
-2. spusti inference DDSPVocoder
-3. ulozi WAV do `<nastroj>-ddsp/generated/`
-
-Parametr `--wet` (0.0–1.0) richa michani: `1.0` = plny DDSP, `0.0` = original.
-Filtry `--notes` a `--vel` omezi generovani na podmnozinu vzorku.
-
-### 6. Kontrola stavu
-
-```bash
-python ddsp.py status --instrument <adresar>
-```
-
-Vypise:
-- pocet zdrojovych WAV souboru
-- pocet NPZ v cache
-- stav checkpointu (velikost modelu, epochy, best_val)
-- pocet generovanych souboru
 
 ---
 
-## Konvertory
+## Adresářová struktura
 
-### SFZ banka → mXXX-velX-fXX.wav
+```
+C:\SoundBanks\
+  ddsp\
+    <nástroj>\          ← zdrojové WAV (READ-ONLY vstup)
+      mXXX-velY-fZZ.wav
+      instrument-definition.json   (volitelné)
+  IthacaPlayer\
+    <nástroj>\          ← vygenerovaná WAV banka (výstup)
 
-Převede libovolnou SFZ instrument banku (Salamander, Piano in 162 a jiné)
-do formátu kompatibilního s DDSP pipeline a sample playerem.
-
-```bash
-python sfz_convert.py <soubor.sfz> <vystupni_adresar> [volby]
-
-# Příklady:
-python sfz_convert.py Salamander.sfz C:/samples/salamander
-python sfz_convert.py Piano162.sfz C:/samples/piano162 --vel-layers 8 --sr 48000
-python sfz_convert.py Salamander.sfz C:/samples/salamander --dry-run
+<nástroj>-ddsp\         ← workspace (vedle zdrojového adresáře)
+  extracts\             ← NPZ cache extrahovaných příznaků
+  checkpoints\
+    best.pt             ← nejlepší checkpoint
+    last.pt             ← poslední epocha (pro --resume)
+    preview\            ← diagnostické WAV po každém best (přepisují se)
+  train.json            ← per-instrument přepisy presetu (volitelné)
+  instrument.json       ← metadata a stav workspace
+  train.log             ← log trénování
 ```
 
-Výstup: adresář s `mXXX-velX-f48.wav` soubory + `instrument-definition.json`.
+Zdrojový adresář není nikdy modifikován. Workspace lze přesunout pomocí
+`--workspace <cesta>`.
+
+---
+
+## Formát názvů souborů
+
+```
+mXXX-velY-fZZ.wav
+^^^  ^^^  ^^^
+|    |    +-- vzorkovací frekvence: f48 = 48 kHz
+|    +------- velocity vrstva: 0–7
++------------ MIDI číslo noty: 000–127  (060 = C4, 021 = A0, 108 = C8)
+```
+
+Soubory bez tohoto formátu jsou podporovány — velocity se odhadne automaticky,
+F0 pomocí pyin (pomalejší).
+
+---
+
+## Tréninkové presety
+
+Všechna nastavení tréninku jsou uložena v **JSON presetech** v adresáři
+`model-presets/`. Program automaticky vybere preset podle zařízení.
+
+| Preset | Zařízení | Model | Batch | Epochy | max_crop | Popis |
+|--------|----------|-------|-------|--------|----------|-------|
+| `piano-cpu` | CPU | small (~598K) | 4 | 200 | 50 fr (0,25 s) | Rychlé epochy na CPU; test konvergence |
+| `piano-cuda` | CUDA GPU | medium (~2,1M) | 16 | 200 | adaptive | Produkce na GPU; plná kvalita |
+| `piano-mps` | Apple Silicon (M1–M3) | medium (~2,1M) | 8 | 200 | adaptive | Konzervativní pro starší MPS |
+| `piano-m5` | **Apple M5** (24 GB) | **large (~4,4M)** | 16 | **1000** | adaptive | **Produkční preset M5 — maximální kvalita** |
+| `piano-m5-medium` | Apple M5 (24 GB) | medium (~2,1M) | 16 | 500 | adaptive | M5 diagnostika / přechodný trénink |
+
+### Úprava presetu
+
+Edituj přímo soubor v `model-presets/`, nebo přidej vlastní:
+
+```json
+// model-presets/muj-preset.json
+{
+  "_description": "Můj vlastní preset",
+  "model": "large",
+  "epochs": 500,
+  "lr": 0.0002,
+  "batch_size": 32,
+  "max_crop": null,
+  "min_voiced": 0.1
+}
+```
+
+```bash
+python ddsp.py learn --instrument ... --preset muj-preset
+```
+
+### Per-instrument přepisy (train.json)
+
+Pro přepis jednotlivých hodnot bez změny presetu vytvoř
+`<workspace>/train.json`:
+
+```json
+{
+  "preset": "piano-cuda",
+  "epochs": 500,
+  "lr": 0.0001
+}
+```
+
+Priorita: **CLI `--preset` > `train.json` > preset soubor**.
+
+---
+
+## Parametry příkazů
+
+### `extract` — extrakce příznaků
+
+```bash
+python ddsp.py extract --instrument <DIR> [--workspace <DIR>] [--chunk-sec 60] [--force-pyin]
+```
 
 | Parametr | Výchozí | Popis |
 |----------|---------|-------|
-| `--vel-layers N` | `8` | Počet velocity vrstev ve výstupu |
-| `--sr HZ` | `48000` | Cílový sample rate v Hz |
-| `--name NAZEV` | z SFZ nebo název souboru | Název nástroje |
-| `--dry-run` | off | Zobraz mapování bez zápisu souborů |
+| `--instrument` | — | Adresář se zdrojovými WAV (povinné) |
+| `--workspace` | `<nástroj>-ddsp/` | Výstupní adresář workspace |
+| `--chunk-sec` | 60 | Rozdělí soubory delší než N sekund na úseky |
+| `--force-pyin` | off | Odhad F0 přes pyin místo z názvu souboru (pomalejší) |
 
-Pokud má SFZ více velocity vrstev než výstup (např. 16 → 8), vybere se
-8 rovnoměrně rozložených vrstev. Pokud méně, použije se nejbližší dostupná.
-Resample probíhá automaticky přes scipy nebo librosa pokud se SR liší.
-
----
-
-### mXXX-velX-fXX.wav → SFZ
-
-Převede existující banku ve formátu sample playeru zpět do standardního SFZ.
-Vhodné pro export do Kontaktu, sforzanda nebo jiných SFZ playerů.
+### `learn` — trénování
 
 ```bash
-python bank_to_sfz.py <adresar_banky> [volby]
-
-# Příklady:
-python bank_to_sfz.py C:/samples/rhodes
-python bank_to_sfz.py C:/samples/rhodes --out C:/exports/rhodes.sfz --sr 48
-python bank_to_sfz.py C:/samples/rhodes --absolute-paths
+python ddsp.py learn --instrument <DIR> [--preset <NAME>] [--resume] [--device auto|cpu|cuda|mps]
 ```
-
-Výstup: `.sfz` soubor vedle adresáře (nebo `--out`).
 
 | Parametr | Výchozí | Popis |
 |----------|---------|-------|
-| `--out FILE` | `<adresar>.sfz` | Výstupní cesta |
-| `--sr KHZ` | preferuje vyšší | Použij jen soubory tohoto SR (např. `48`) |
-| `--name NAZEV` | z `instrument-definition.json` | Název nástroje |
-| `--absolute-paths` | off | Absolutní cesty místo relativních |
+| `--instrument` | — | Adresář se zdrojovými WAV (povinné) |
+| `--workspace` | `<nástroj>-ddsp/` | Workspace |
+| `--preset` | auto dle zařízení | Název presetu z `model-presets/` |
+| `--resume` | off | Pokračovat od `last.pt` |
+| `--device` | auto | `auto` / `cpu` / `cuda` / `mps` (Apple Silicon) |
 
-Key ranges jsou automaticky rozloženy — každá nota pokrývá oblast od středu
-k sousední notě vlevo a vpravo. Krajní noty sahají na MIDI 0 a 127.
-Velocity vrstvy 0–7 jsou mapovány na rovnoměrné pásma 0–127.
+Všechna ostatní nastavení (model, epochy, lr, batch…) jsou v presetu nebo `train.json`.
+
+### `generate` — generování vzorků
+
+```bash
+python ddsp.py generate --instrument <DIR> [volby]
+```
+
+| Parametr | Výchozí | Popis |
+|----------|---------|-------|
+| `--instrument` | — | Povinné |
+| `--full-range` | off | Syntetizuj celý rozsah not (vyžaduje EnvelopeNet nebo NPZ) |
+| `--midi-lo` | `21` | Nejnižší nota (A0) |
+| `--midi-hi` | `108` | Nejvyšší nota (C8) |
+| `--vel-layers` | `8` | Počet velocity vrstev |
+| `--envelope-source` | `auto` | `auto` / `envelopenet` / `npz` |
+| `--wet` | `1.0` | Mix DDSP/originál (0,0–1,0) |
+| `--inharmonicity-scale` | `1.0` | `0`=čistě harmonické · `1`=naučené · `2`=zesílené |
+| `--decay-scale` | `1.0` | `0`=bez fyzikálního decay · `1`=naučené · `2`=rychlejší |
+| `--output` | IthacaPlayer/... | Výstupní adresář |
+| `--no-skip` | off | Přepsat existující soubory |
+
+### `learn-envelope` — trénování EnvelopeNet
+
+```bash
+python ddsp.py learn-envelope --instrument <DIR> [--epochs 1000]
+```
+
+Volitelná malá síť (~30 K param) pro predikci hlasitostní obálky z (MIDI, velocity).
+Potřebná pro `--full-range` bez referenčních NPZ.
+
+### `status` — stav workspace
+
+```bash
+python ddsp.py status --instrument <DIR>
+```
 
 ---
 
-## Graficke rozhrani
+## Grafické rozhraní
 
 ```bash
 python gui.py [--port 7860] [--share]
 ```
 
-Otevre Gradio aplikaci v prohlizeci. Obsahuje zalozky:
-- **Nastroj & Stav** — zadani cesty a zobrazeni stavu
-- **Extrakce** — spusteni extrakce s nastavenim chunk-sec
-- **Uceni** — vyber velikosti modelu, poctu epoch, learning rate a resume
-- **Generovani** — filtrovani not a velocity, nastaveni wet/dry
-
-Log se aktualizuje kazdé 2 sekundy. Tlacitko Stop prerusi beh prikazu.
+Otevře Gradio aplikaci (`http://127.0.0.1:7860`).
 
 ---
 
-## Reference
+## Velikosti modelů
 
-### Prikazy CLI
+| Preset | Model | Parametry | Popis |
+|--------|-------|-----------|-------|
+| `piano-cpu` | small | ~598 K | Rychlá diagnostika na CPU |
+| `piano-cuda` / `piano-mps` | medium | ~2,1 M | **Výchozí produkční model** — 2vrstvý GRU |
+| vlastní | large | ~4,4 M | Nejvyšší kvalita; GPU doporučeno |
 
-| Prikaz | Popis |
-|--------|-------|
-| `extract` | Extrahuje a cachuje priznaky ze zdrojovych WAV |
-| `learn` | Trenuje model (auto-spusti extract pokud chybi NPZ) |
-| `generate` | Generuje WAV banka -> `C:\SoundBanks\IthacaPlayer\<nastroj>\` |
-| `status` | Zobrazi stav nastroje |
+Klíčová charakteristika: GRU vrstvy jsou dominantní složka medium/large
+(47 % parametrů). Noise heads platí při mlp_dim=512.
 
-Vsechny prikazy podporuji `--workspace <cesta>` pro override umisteni
-extracts/checkpoints (uzitecne po presunuti zdrojovych dat).
+---
 
-### Parametry `learn`
+## Dokumentace
 
-| Parametr | Vychozi | Popis |
-|----------|---------|-------|
-| `--model` | `small` | Velikost modelu: `small`, `medium`, `large` |
-| `--epochs` | `100` | Pocet trenicich epoch |
-| `--lr` | `3e-4` | Learning rate (Adam) |
-| `--batch-size` | `4` | Velikost batch |
-| `--resume` | off | Pokracovat od `last.pt` |
-| `--min-voiced` | `0.1` | Min. podil voiced ramcu v okne |
-
-### Parametry `generate`
-
-| Parametr | Vychozi | Popis |
-|----------|---------|-------|
-| `--wet` | `1.0` | Pomer DDSP / original (0.0–1.0) |
-| `--notes` | vse | Filtr not, napr. `C4 A3 G3` |
-| `--vel` | vse | Filtr velocity vrstev, napr. `5 7` |
-| `--output` | `C:\SoundBanks\IthacaPlayer\<nastroj>` | Vystupni adresar |
-| `--no-skip` | off | Prepsat existujici soubory |
-
-### Velikosti modelu
-
-| Preset | Parametry | gru_hidden | Vrstvy GRU | mlp_dim |
-|--------|-----------|-----------|------------|---------|
-| `small` | ~115 K | 64 | 1 | 128 |
-| `medium` | ~452 K | 128 | 2 | 256 |
-| `large` | ~1.99 M | 256 | 3 | 512 |
-
-### Identifikace nastroje
-
-Jmeno adresare v `C:\SoundBanks\ddsp\` je master identifikator nastroje.
-Od nej se odviji vsechny ostatni cesty automaticky:
-
-```
---instrument C:\SoundBanks\ddsp\vintage-vibe
-                                 ^^^^^^^^^^^
-                                 |
-                                 +-- workspace:  C:\SoundBanks\ddsp\vintage-vibe-ddsp\
-                                 +-- IthacaPlayer: C:\SoundBanks\IthacaPlayer\vintage-vibe\
-```
-
-Pojmenuj adresar jednou spravne — vse ostatni se odvodi samo.
-
-### Format nazvu souboru
-
-```
-mXXX-velY-fZZ.wav
-^^^  ^^^  ^^^
-|    |    +-- vzorkovaci frekvence: f48 = 48 kHz, f44 = 44.1 kHz
-|    +------- velocity vrstva: 0–7 (0 = nejticejsi, 7 = nejhlasitejsi)
-+------------ MIDI cislo noty: 000–127 (060 = C4, 069 = A4)
-```
-
-Soubory bez tohoto formatu jsou podporovany — velocity se odhadne automaticky.
-
-### Struktura workspace
-
-```
-<nastroj>-ddsp/
-  extracts/          NPZ cache (audio + f0 + loudness_L/R + voiced_prob + vel_frames)
-  checkpoints/       best.pt, last.pt
-  instrument.json    konfigurace a stav
-  train.log          log trenovani
-```
-
-Vygenerovane vzorky nejdou do workspace, ale primo do IthacaPlayer:
-```
-C:\SoundBanks\IthacaPlayer\<nastroj>\   <- vystup generate
-```
+| Dokument | Obsah |
+|----------|-------|
+| `docs/ARCHITECTURE.md` | Signálový model, síťová architektura, konstanty |
+| `docs/MODEL_ROADMAP.md` | Implementované funkce, roadmap |
+| `docs/NPZ_FORMAT.md` | Formát NPZ cache souborů |
+| `docs/WORKFLOW_EXAMPLES.md` | Příklady pro různé nástroje |
+| `docs/BASS_REFACTOR_CONCEPT.md` | Fyzikální základ dvoukomponentního decay |

@@ -39,16 +39,14 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from model_ddsp import (
-    build_ddsp, count_params, FRAME_HOP, SR, F0_MAX,
-    DDSPVocoder, MODEL_SIZES,
-    EnvelopeNet, N_ENV, ENVELOPE_WARP,
-)
+from synth.constants import SR, FRAME_HOP, F0_MAX, MODEL_SIZES, DEVICE_DEFAULT_PRESET
+from model.vocoder   import DDSPVocoder, build_ddsp, count_params
+from model.envelope  import EnvelopeNet, N_ENV, ENVELOPE_WARP
 from audio_io import load_wav_stereo, save_wav, scan_instrument_dir, parse_filename
-
-CROP_FRAMES = 50   # 0.25 s of frames per training window
+from training.dataset import SourceDataset, crop_frames, CropBucketSampler
+from training.loss    import mrstft_loss, _attack_weight
 
 # IthacaPlayer output root — generated sample banks land here
 ITHACA_PLAYER_ROOT = os.environ.get('ITHACA_ROOT', r'C:\SoundBanks\IthacaPlayer')
@@ -70,9 +68,11 @@ class Workspace:
     @property
     def generated_dir(self):   return os.path.join(self.work_dir, 'generated')
     @property
-    def config_path(self):     return os.path.join(self.work_dir, 'instrument.json')
+    def config_path(self):      return os.path.join(self.work_dir, 'instrument.json')
     @property
-    def log_path(self):        return os.path.join(self.work_dir, 'train.log')
+    def train_config_path(self): return os.path.join(self.work_dir, 'train.json')
+    @property
+    def log_path(self):         return os.path.join(self.work_dir, 'train.log')
     @property
     def name(self):
         return os.path.basename(os.path.normpath(self.source_dir))
@@ -118,6 +118,103 @@ def save_config(ws: Workspace, cfg: dict):
     ws.makedirs()
     with open(ws.config_path, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Preset + training configuration
+# ---------------------------------------------------------------------------
+
+_PRESETS_DIR = os.path.join(os.path.dirname(__file__), 'model-presets')
+# Keys starting with _ are metadata, not training params
+_PRESET_META_PREFIX = '_'
+
+
+def list_presets() -> list[str]:
+    """Return sorted list of available preset names (without .json extension)."""
+    if not os.path.isdir(_PRESETS_DIR):
+        return []
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(_PRESETS_DIR)
+        if f.endswith('.json') and not f.startswith('_')
+    )
+
+
+def load_preset(name: str) -> dict:
+    """Load a preset by name from model-presets/<name>.json.
+
+    Returns only the training parameter keys (strips _description etc.).
+    Raises FileNotFoundError with a helpful message if not found.
+    """
+    path = os.path.join(_PRESETS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        available = list_presets()
+        raise FileNotFoundError(
+            f'Preset "{name}" not found in {_PRESETS_DIR}.\n'
+            f'Available presets: {available}'
+        )
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if not k.startswith(_PRESET_META_PREFIX)}
+
+
+def load_train_config(ws: Workspace) -> dict:
+    """Load workspace train.json if it exists.
+
+    train.json may contain:
+        "preset": "<name>"   — override the device-auto-selected preset
+        any training param   — override individual values from the preset
+    """
+    if os.path.exists(ws.train_config_path):
+        with open(ws.train_config_path, encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_train_config(ws: Workspace, preset_name: str):
+    """Write a starter train.json pointing to the given preset."""
+    ws.makedirs()
+    data = {"preset": preset_name}
+    with open(ws.train_config_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+
+
+def resolve_train_params(device: str, ws: Workspace, cli_args) -> dict:
+    """Merge preset / train.json / CLI args into a final training parameter dict.
+
+    Priority (highest first):
+        1. Explicit CLI flags   (--model, --lr, --batch-size, --max-crop, --epochs)
+        2. workspace/train.json (can override preset or just set "preset")
+        3. model-presets/<name>.json  (auto-selected from device or train.json)
+        4. hard-coded fallback values
+
+    Returns dict with keys: model, epochs, lr, batch_size, max_crop, min_voiced,
+                             preset_name (informational).
+    """
+    # Step 1: determine preset name
+    dev_type     = ('cuda' if str(device).startswith('cuda') else
+                    'mps'  if str(device) == 'mps'          else 'cpu')
+    train_cfg    = load_train_config(ws)
+    preset_name  = (getattr(cli_args, 'preset', None)
+                    or train_cfg.get('preset')
+                    or DEVICE_DEFAULT_PRESET.get(dev_type, 'piano-cpu'))
+
+    # Step 2: load preset values
+    try:
+        params = load_preset(preset_name)
+    except FileNotFoundError as e:
+        print(f'[ddsp]  WARNING: {e}')
+        params = {'model': 'small', 'epochs': 200, 'lr': 0.0003,
+                  'batch_size': 4, 'max_crop': 50, 'min_voiced': 0.1}
+
+    # Step 3: apply train.json overrides (skip 'preset' key itself)
+    for k, v in train_cfg.items():
+        if k != 'preset':
+            params[k] = v
+
+    params['preset_name'] = preset_name
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -285,120 +382,6 @@ def extract_and_cache(source_dir: str, extracts_dir: str, chunk_sec: int = 0,
 
 
 # ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class SourceDataset(Dataset):
-    def __init__(self, extracts_dir: str, min_voiced: float = 0.1):
-        self.crop  = CROP_FRAMES
-        self.hop   = FRAME_HOP
-        self.items = []
-        self.data  = []
-        self.midi_per_file = []   # midi note per NPZ file (for coupled training)
-        npz_files  = sorted(glob.glob(os.path.join(extracts_dir, '*.npz')))
-        if not npz_files:
-            raise FileNotFoundError(
-                f'No NPZ files in {extracts_dir}.\n'
-                f'Run: python ddsp.py extract --instrument <path>'
-            )
-        total_frames = 0
-        for fi, path in enumerate(npz_files):
-            print(f'  loading {os.path.basename(path)} ...', flush=True)
-            raw = np.load(path)
-            d   = {k: raw[k].copy() for k in raw.files}
-            self.data.append(d)
-            parsed = parse_filename(path)
-            self.midi_per_file.append(parsed[0] if parsed else 60)
-            T   = len(d['f0'])
-            if T < self.crop + 1:
-                continue
-            step = max(1, self.crop // 2)
-            for start in range(0, T - self.crop, step):
-                if d['voiced_prob'][start:start + self.crop].mean() >= min_voiced:
-                    self.items.append((fi, start))
-            total_frames += T
-        if not self.items:
-            print('[dataset] WARNING: no voiced windows found -- using all windows.')
-            for fi, d in enumerate(self.data):
-                T = len(d['f0'])
-                for start in range(0, T - self.crop, self.crop // 4):
-                    self.items.append((fi, start))
-        dur = total_frames / (SR / FRAME_HOP)
-        print(f'[dataset] {len(npz_files)} file(s)  {dur:.0f}s  {len(self.items)} windows')
-
-    def __len__(self): return len(self.items)
-
-    def __getitem__(self, idx):
-        fi, start = self.items[idx]
-        d  = self.data[fi]
-        sl = slice(start, start + self.crop)
-        f0  = d['f0'][sl].astype(np.float32)
-        loL = d['loudness_L'][sl].astype(np.float32)
-        loR = d['loudness_R'][sl].astype(np.float32)
-        vp  = d['voiced_prob'][sl].astype(np.float32)
-        s_s = start * self.hop
-        audio = d['audio'][:, s_s:s_s + self.crop * self.hop].astype(np.float32)
-        if random.random() < 0.5:
-            db  = random.uniform(-2.0, 2.0)
-            g   = 10.0 ** (db / 20.0)
-            audio = audio * g; loL += db; loR += db
-        vel_mean = float(d['vel_frames'][sl].mean())
-        midi     = self.midi_per_file[fi]
-        return (torch.from_numpy(f0), torch.from_numpy(loL), torch.from_numpy(loR),
-                torch.from_numpy(vp), torch.from_numpy(audio),
-                torch.tensor(vel_mean, dtype=torch.float32),
-                torch.tensor(midi,     dtype=torch.long),
-                torch.tensor(start,    dtype=torch.long))
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def _attack_weight(lo_db, n_samples, alpha=4.0, sigma=2.0):
-    """Attack-emphasis weight upsampled to sample level.
-
-    lo_db   : (B, F) loudness in dB per frame
-    returns : (B, 1, n_samples) weight tensor, floor=1.0, peak=1+alpha
-    """
-    B, n_frames = lo_db.shape
-    # Gaussian smooth along time
-    radius = int(4 * sigma + 0.5)
-    k = torch.arange(-radius, radius + 1, dtype=lo_db.dtype, device=lo_db.device)
-    kernel = torch.exp(-0.5 * (k / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    lo_smooth = F.conv1d(lo_db.unsqueeze(1), kernel.view(1, 1, -1), padding=radius).squeeze(1)
-    # Positive derivative = attack
-    dl = torch.diff(lo_smooth, prepend=lo_smooth[:, :1], dim=1)
-    dl_pos = dl.clamp(min=0.0)
-    dl_norm = dl_pos / (dl_pos.amax(dim=1, keepdim=True) + 1e-6)
-    attack_w = 1.0 + alpha * dl_norm                        # (B, F)
-    # Upsample to sample resolution
-    w_up = F.interpolate(attack_w.unsqueeze(1), size=n_samples,
-                         mode='linear', align_corners=False)  # (B, 1, n_samples)
-    return w_up
-
-
-def mrstft_loss(pred, target, fft_sizes=(256, 1024, 4096, 16384)):
-    B, C, T = pred.shape
-    p_flat  = pred.reshape(B * C, T)
-    t_flat  = target.reshape(B * C, T)
-    total, n_valid = pred.sum() * 0.0, 0
-    for n_fft in fft_sizes:
-        if n_fft >= T: continue
-        hop = n_fft // 4
-        win = torch.hann_window(n_fft, device=pred.device)
-        Sp  = torch.stft(p_flat, n_fft, hop, n_fft, win, return_complex=True)
-        St  = torch.stft(t_flat, n_fft, hop, n_fft, win, return_complex=True)
-        mp  = (Sp.real.pow(2) + Sp.imag.pow(2) + 1e-8).sqrt()
-        mt  = (St.real.pow(2) + St.imag.pow(2) + 1e-8).sqrt()
-        sc  = ((mp - mt).pow(2).sum() + 1e-8).sqrt() / (mt.pow(2).sum() + 1e-8).sqrt()
-        lm  = F.l1_loss(torch.log(mp + 1e-7), torch.log(mt + 1e-7))
-        total += sc + lm; n_valid += 1
-    return total / max(n_valid, 1)
-
-
-# ---------------------------------------------------------------------------
 # Generation utilities
 # ---------------------------------------------------------------------------
 
@@ -473,14 +456,16 @@ def find_envelope(templates: dict, midi: int, vel: int) -> np.ndarray:
 @torch.no_grad()
 def synthesize(model: DDSPVocoder, midi: int, velocity: float,
                loudness: np.ndarray, device: torch.device,
-               inh_scale: float = 1.0) -> np.ndarray:
+               inh_scale: float = 1.0,
+               decay_scale: float = 1.0) -> np.ndarray:
     """Synthesize one note -> (2, T) float32"""
     n_frames = len(loudness)
     freq     = 440.0 * (2.0 ** ((midi - 69) / 12.0))
     f0_t  = torch.from_numpy(np.full(n_frames, freq, np.float32)).unsqueeze(0).to(device)
     lo_t  = torch.from_numpy(loudness).unsqueeze(0).to(device)
     vel_t = torch.tensor([float(velocity)], dtype=torch.float32, device=device)
-    out   = model(f0_t, lo_t, vel_t, n_frames, inh_scale=inh_scale)
+    out   = model(f0_t, lo_t, vel_t, n_frames, inh_scale=inh_scale,
+                  decay_scale=decay_scale)
     return out[0].cpu().numpy()   # (2, T)
 
 
@@ -523,6 +508,50 @@ def cmd_extract(args):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic generation — called after each new best checkpoint
+# ---------------------------------------------------------------------------
+
+# 16 notes spread across the piano (low / mid / high), all velocity 5.
+# Files are always overwritten — only the latest best checkpoint is kept.
+_DIAG_NOTES = [
+    # Low  (A0–E2)
+    21, 24, 33, 36, 40,
+    # Mid  (A3–E5)
+    57, 60, 64, 69, 72, 76,
+    # High (A5–C7)
+    81, 84, 88, 93, 96,
+]
+_DIAG_VEL = 5
+
+@torch.no_grad()
+def _diag_generate(model: DDSPVocoder, ws, epoch: int, device):
+    """Generate a spread of notes after each new best checkpoint.
+
+    Output: checkpoints/preview/m{midi:03d}_vel{vel}.wav
+    Previous files are overwritten — only the latest best set is kept.
+    Silently skips if extracts are not ready yet.
+    """
+    templates = load_envelope_templates(ws.extracts_dir)
+    if not templates:
+        return
+    preview_dir = os.path.join(ws.checkpoints_dir, 'preview')
+    os.makedirs(preview_dir, exist_ok=True)
+    model.eval()
+    generated = 0
+    for midi in _DIAG_NOTES:
+        try:
+            loudness = find_envelope(templates, midi, _DIAG_VEL)
+            audio    = synthesize(model, midi, float(_DIAG_VEL), loudness, device)
+            name     = f'm{midi:03d}_vel{_DIAG_VEL}.wav'
+            save_wav(os.path.join(preview_dir, name), audio, SR)
+            generated += 1
+        except Exception as exc:
+            print(f'  [preview] m{midi:03d}: {exc}')
+    if generated:
+        print(f'  [preview] {generated} notes -> {preview_dir}  (ep {epoch})')
+
+
+# ---------------------------------------------------------------------------
 # Command: learn
 # ---------------------------------------------------------------------------
 
@@ -530,21 +559,37 @@ def cmd_learn(args):
     ws = make_workspace(args.instrument, getattr(args, "workspace", None))
     ws.makedirs()
 
+    # ------------------------------------------------------------------ #
+    # Device + preset resolution                                         #
+    # ------------------------------------------------------------------ #
+    device = resolve_device(getattr(args, 'device', 'auto'))
+    tp     = resolve_train_params(device, ws, args)   # merged preset/train.json/CLI
+
+    batch_size = tp['batch_size']
+    lr_init    = tp['lr']
+    max_crop   = tp['max_crop']
+
     cfg = load_config(ws)
     saved_size = cfg.get('model_size')
     if saved_size:
-        # instrument.json is authoritative — ignore --model to prevent size mismatch
         if args.model and args.model != saved_size:
             print(f'[ddsp learn]  WARNING: --model {args.model} ignored; '
                   f'instrument.json specifies model_size={saved_size}. '
                   f'Delete the workspace to start fresh with a different size.')
         model_size = saved_size
     else:
-        model_size = args.model or 'small'
+        model_size = tp['model']
     if model_size not in MODEL_SIZES:
         print(f'[ddsp learn] ERROR: unknown model size "{model_size}". '
               f'Choose from: {list(MODEL_SIZES)}')
         sys.exit(1)
+
+    print(f'[ddsp learn]  instrument={ws.name}  device={device}  '
+          f'preset={tp["preset_name"]}')
+    print(f'              model={model_size}  batch={batch_size}  '
+          f'max_crop={max_crop}  lr={lr_init:.0e}  epochs={tp["epochs"]}')
+    print(f'              source  -> {ws.source_dir}')
+    print(f'              work    -> {ws.work_dir}')
 
     # Auto-extract if no NPZ found
     npz_files = glob.glob(os.path.join(ws.extracts_dir, '*.npz'))
@@ -552,14 +597,9 @@ def cmd_learn(args):
         print('[ddsp learn] No extracts found -- running extraction first.')
         extract_and_cache(ws.source_dir, ws.extracts_dir, chunk_sec=60)
 
-    device = resolve_device(getattr(args, 'device', 'auto'))
-    print(f'[ddsp learn]  instrument={ws.name}  model={model_size}  device={device}')
-    print(f'              source  -> {ws.source_dir}')
-    print(f'              work    -> {ws.work_dir}')
-
-    # --- coupled mode: train EnvelopeNet first, then use its predictions during DDSP training ---
+    # --- coupled mode ---
     coupled   = getattr(args, 'coupled', False)
-    env_mix   = getattr(args, 'env_mix', 0.5)   # fraction of batches using EnvelopeNet loudness
+    env_mix   = getattr(args, 'env_mix', 0.5)
     env_model = None
     if coupled:
         env_pt = os.path.join(ws.checkpoints_dir, 'envelope.pt')
@@ -573,20 +613,23 @@ def cmd_learn(args):
         print(f'[ddsp learn]  Coupled mode: env_mix={env_mix:.0%}  '
               f'(n_env={env_model.n_env}  warp={env_model._warp})')
 
-    dataset = SourceDataset(ws.extracts_dir, min_voiced=args.min_voiced)
+    dataset = SourceDataset(ws.extracts_dir, min_voiced=tp['min_voiced'],
+                            max_crop=max_crop)
     n_val   = max(1, int(len(dataset) * 0.08))
     n_train = len(dataset) - n_val
     train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_sampler = CropBucketSampler(train_ds, batch_size, shuffle=True)
+    val_sampler   = CropBucketSampler(val_ds,   batch_size, shuffle=False)
+    train_loader  = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=0)
+    val_loader    = DataLoader(val_ds,   batch_sampler=val_sampler,   num_workers=0)
 
     model    = build_ddsp(size=model_size).to(device)
     n_params = count_params(model)
     print(f'[ddsp learn]  params={n_params:,}  n_train={n_train}  n_val={n_val}')
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_init)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
+        optimizer, T_max=tp['epochs'], eta_min=lr_init * 0.05)
 
     start_epoch, best_val = 0, float('inf')
     last_pt = os.path.join(ws.checkpoints_dir, 'last.pt')
@@ -608,14 +651,16 @@ def cmd_learn(args):
 
     # Training log
     log_f = open(ws.log_path, 'a', buffering=1)
-    log_f.write(f'\n--- {_now()}  model={model_size}  epochs={args.epochs}  lr={args.lr} ---\n')
+    log_f.write(f'\n--- {_now()}  model={model_size}  epochs={tp['epochs']}  lr={lr_init}  '
+                f'preset={tp["preset_name"]}  max_crop={max_crop} ---\n')
 
     def _get_loudness(loL, loR, vel_b, midi_b, start_b):
         """Return loudness tensor for a batch.
         Coupled mode: with probability env_mix, replace real NPZ loudness with
         EnvelopeNet prediction (sliced to the same crop window).
         """
-        lo_real = (loL + loR) * 0.5   # (B, CROP_FRAMES) from NPZ
+        lo_real   = (loL + loR) * 0.5   # (B, crop_len)
+        crop_len  = lo_real.shape[1]
         if env_model is None or random.random() >= env_mix:
             return lo_real.to(device)
         lo_list = []
@@ -624,7 +669,7 @@ def cmd_learn(args):
             vel_i   = round(float(vel_b[b].item()))
             st      = int(start_b[b].item())
             env_arr = env_model.predict_envelope(midi_i, vel_i, warp=env_model._warp)
-            end     = st + CROP_FRAMES
+            end     = st + crop_len
             if len(env_arr) >= end:
                 chunk = env_arr[st:end]
             else:
@@ -633,7 +678,7 @@ def cmd_learn(args):
             lo_list.append(torch.from_numpy(chunk))
         return torch.stack(lo_list).to(device)
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    for epoch in range(start_epoch, start_epoch + tp['epochs']):
         model.train()
         t0, train_losses = time.time(), []
         for f0, loL, loR, vp, audio, vel, midi_b, start_b in train_loader:
@@ -641,7 +686,7 @@ def cmd_learn(args):
             audio = audio.to(device)
             vel   = vel.to(device)
             lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
-            pred  = model(f0, lo, vel, CROP_FRAMES)
+            pred  = model(f0, lo, vel, f0.shape[1])
             aw    = _attack_weight(lo, pred.shape[-1])
             loss  = (mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
                      + 0.3 * mrstft_loss(pred * aw, audio * aw))
@@ -659,7 +704,7 @@ def cmd_learn(args):
                 audio = audio.to(device)
                 vel   = vel.to(device)
                 lo    = _get_loudness(loL, loR, vel, midi_b, start_b)
-                pred  = model(f0, lo, vel, CROP_FRAMES)
+                pred  = model(f0, lo, vel, f0.shape[1])
                 aw    = _attack_weight(lo, pred.shape[-1])
                 val_losses.append((mrstft_loss(pred, audio) + 0.2 * F.l1_loss(pred, audio)
                                    + 0.3 * mrstft_loss(pred * aw, audio * aw)).item())
@@ -672,6 +717,7 @@ def cmd_learn(args):
             best_val = vl
             torch.save({'model': model.state_dict(), 'model_size': model_size}, best_pt)
             best_tag = '  <- best'
+            _diag_generate(model, ws, epoch, device)
 
         line = (f'ep {epoch:4d}  train={tl:.4f}  val={vl:.4f}  '
                 f'lr={lr_now:.2e}  {elapsed:.1f}s{best_tag}')
@@ -698,7 +744,7 @@ def cmd_learn(args):
     cfg.update({'instrument': ws.name, 'source_dir': ws.source_dir,
                 'model_size': model_size, 'sr': SR,
                 'training': {
-                    'epochs_completed': start_epoch + args.epochs,
+                    'epochs_completed': start_epoch + tp['epochs'],
                     'best_val': best_val,
                     'last_trained': _now(),
                 }})
@@ -872,6 +918,7 @@ def cmd_generate(args):
 
     attack_ramp_ms = getattr(args, 'attack_ramp_ms', 10)
     inh_scale      = float(getattr(args, 'inh_scale', 1.0))
+    decay_scale    = float(getattr(args, 'decay_scale', 1.0))
 
     wet    = float(np.clip(getattr(args, 'wet', 1.0), 0.0, 1.0))
     n_vel  = args.vel_layers
@@ -932,7 +979,8 @@ def cmd_generate(args):
                         loudness = env_model.predict_envelope(midi, vel, warp=env_model._warp)
                     else:
                         loudness = find_envelope(templates, midi, vel)
-                    audio    = synthesize(model, midi, float(vel), loudness, device, inh_scale=inh_scale)
+                    audio    = synthesize(model, midi, float(vel), loudness, device,
+                                         inh_scale=inh_scale, decay_scale=decay_scale)
                     audio    = apply_attack_ramp(audio, attack_ramp_ms)
                     dur_s    = len(loudness) * FRAME_HOP / SR
                     save_wav(out_path, audio, SR)
@@ -1012,7 +1060,8 @@ def cmd_generate(args):
                 else:
                     loudness = find_envelope(templates, midi, vel)
                 dur_s = len(loudness) * FRAME_HOP / SR
-                audio = synthesize(model, midi, float(vel), loudness, device, inh_scale=inh_scale)
+                audio = synthesize(model, midi, float(vel), loudness, device,
+                                   inh_scale=inh_scale, decay_scale=decay_scale)
                 if wet < 1.0:
                     ref = load_wav_stereo(wav_lookup[(midi, vel)], target_sr=SR)
                     T   = ref.shape[-1]
@@ -1097,23 +1146,16 @@ def main():
 
     # --- learn ---
     p_lrn = subs.add_parser('learn', help='Train model (runs extract if needed)')
-    p_lrn.add_argument('--instrument', required=True, metavar='DIR')
+    p_lrn.add_argument('--instrument', required=True, metavar='DIR',
+                       help='Path to the instrument sample bank directory')
     p_lrn.add_argument('--workspace', default=None, metavar='DIR', help=_ws_help)
-    p_lrn.add_argument('--model', choices=list(MODEL_SIZES), default=None,
-                       help='Model size: small (~115K), medium (~452K), large (~1.99M)')
-    p_lrn.add_argument('--epochs',     type=int,   default=100)
-    p_lrn.add_argument('--lr',         type=float, default=3e-4)
-    p_lrn.add_argument('--resume',     action='store_true',
-                       help='Continue from last checkpoint')
-    p_lrn.add_argument('--batch-size', type=int,   default=4, dest='batch_size')
-    p_lrn.add_argument('--min-voiced', type=float, default=0.1, dest='min_voiced',
-                       help='Minimum voiced frame fraction per window (default: 0.1)')
-    p_lrn.add_argument('--coupled', action='store_true',
-                       help='Coupled mode: train EnvelopeNet first, then use its loudness '
-                            'predictions during DDSP training (aligns train/inference distributions)')
-    p_lrn.add_argument('--env-mix', type=float, default=0.5, dest='env_mix',
-                       help='Fraction of training batches using EnvelopeNet loudness in '
-                            'coupled mode (default: 0.5)')
+    p_lrn.add_argument('--preset', default=None, metavar='NAME',
+                       help=f'Training preset from model-presets/<name>.json. '
+                            f'Auto-detected from device if not set. '
+                            f'Available: {list_presets()}. '
+                            f'Fine-tune individual params via workspace/train.json.')
+    p_lrn.add_argument('--resume', action='store_true',
+                       help='Continue training from the last checkpoint')
     p_lrn.add_argument('--device', default='auto',
                        choices=['auto', 'cpu', 'mps', 'cuda'],
                        help='Compute device: auto (default), cpu, mps (Apple Silicon), cuda')
@@ -1127,6 +1169,9 @@ def main():
     p_gen.add_argument('--inharmonicity-scale', type=float, default=1.0, metavar='0-2',
                        dest='inh_scale',
                        help='Inharmonicity multiplier: 0=pure harmonic, 1=learned B, 2=exaggerated (default: 1.0)')
+    p_gen.add_argument('--decay-scale', type=float, default=1.0, metavar='0-2',
+                       dest='decay_scale',
+                       help='Physics decay multiplier: 0=no decay, 1=learned b1/b3, 2=faster doznivani (default: 1.0)')
     p_gen.add_argument('--output',  default=None, metavar='DIR',
                        help=f'Output directory (default: {ITHACA_PLAYER_ROOT}\\<instrument>)')
     p_gen.add_argument('--notes',   nargs='+', default=None, metavar='NOTE',

@@ -154,7 +154,7 @@ Loudness se do sítě **nepodává** — viz decoupled architektura výše.
 Velocity je statická pro celou notu a je broadcastována na (B, T, VEL_DIM).
 Výsledný vstupní vektor na rámec: 64 + 8 = **72 dimenzí**.
 
-`encode_loudness` je stále definován v `model_ddsp.py` pro případné pozdější rozšíření,
+`encode_loudness` je definován v `model/encoders.py` pro případné pozdější rozšíření,
 ale není součástí trénovací cesty.
 
 ### pre_mlp
@@ -418,3 +418,44 @@ python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --
 python ddsp.py learn --instrument C:\SoundBanks\ddsp\salamander --model small --epochs 300 \
     --coupled --env-mix 0.5
 ```
+
+---
+
+## Struktura kódu — framework balíčky
+
+Po refaktorizaci ([dev-bass-refactor / Phase 0]) je kód rozdělen do čitelných balíčků:
+
+```
+synth/
+  constants.py   — SR, FRAME_HOP, N_HARM_MAX, N_NOISE, F0_BINS, VEL_DIM, MODEL_SIZES
+  harmonic.py    — HarmonicSynth: additivní syntéza s inharmonicitou
+  noise.py       — NoiseSynth: harmonic-relative STFT tvarování šumu
+  __init__.py    — re-exportuje vše
+
+model/
+  encoders.py    — encode_f0, encode_velocity, encode_loudness (sinusoidální enkodéry)
+  vocoder.py     — DDSPVocoder, build_ddsp, count_params
+  envelope.py    — EnvelopeNet (tiny MLP pro predikci loudness obálky)
+  __init__.py    — re-exportuje vše
+
+training/
+  dataset.py     — SourceDataset s adaptivním crop_frames(midi)
+  loss.py        — mrstft_loss, _attack_weight
+  __init__.py    — re-exportuje vše
+
+ddsp.py          — CLI vstupní bod (extract / learn / generate / status)
+model_ddsp.py    — backward-compat shim (re-exportuje z výše uvedených balíčků)
+audio_io.py      — načítání/ukládání WAV, scan_instrument_dir, parse_filename
+```
+
+### Adaptivní tréninkové okno (`training/dataset.py`)
+
+Délka trénovacího okna je závislá na MIDI notě:
+
+| MIDI | Nota | Okno | Délka | Důvod |
+|------|------|------|-------|-------|
+| ≤24  | A0   | 2000 fr | 10 s | 2× τ_slow (zig-zag polarizace) |
+| 48   | C3   | 1025 fr | 5 s  | překrývá celý sustain |
+| ≥72  | C5   | 50 fr   | 0.25 s | původní chování |
+
+Funkce `crop_frames(midi)` provede lineární interpolaci mezi těmito hodnotami.
