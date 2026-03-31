@@ -1,0 +1,11 @@
+{
+  "_description": "Grand Piano — CPU quality run. Medium model, max_crop=200 (1.07s = 28 cycles of A0). Restores bass learning at the cost of ~8-12h/epoch. Use when CPU time is not a constraint and perceptual bass quality matters.",
+  "_device": "cpu",
+
+  "model":      "medium",
+  "epochs":     500,
+  "lr":         0.0003,
+  "batch_size": 4,
+  "max_crop":   200,
+  "min_voiced": 0.1
+}
