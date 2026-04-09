@@ -1,7 +1,17 @@
 # DDSP Neural Vocoder
 
-Naučí timbre Grand Piana z WAV vzorků a syntetizuje stereo WAV banku
-kompatibilní se samplerovými pluginy (IthacaPlayer, Kontakt, SFZ).
+Neuronová síť, která se naučí zvuk akustického klavíru z nahrávek a syntetizuje
+stereo WAV banku kompatibilní se samplerovými pluginy (IthacaPlayer, Kontakt, SFZ).
+
+Technologie: **DDSP** (Differentiable Digital Signal Processing) — fyzikálně
+interpretovatelné bloky místo black-boxu. Model obsahuje sinusové oscilátory
+pro harmonické složky, šumový syntetizátor pro přechodové jevy a explicitní
+parametry pro inharmonicitu a dvoustupňový decay strun.
+
+**Aktuální trénink:** `ks-grand` (Yamaha grand piano, 88 not × 8 velocity),
+medium model (2.1M params), max_crop=200 (1.07 s), ep 38/500, val loss 1.8398.
+
+> Podrobný popis projektu, co se počítalo a kde jsme: **[PROGRESS.md](PROGRESS.md)**
 
 Technická architektura a roadmap jsou v `docs/`.
 
