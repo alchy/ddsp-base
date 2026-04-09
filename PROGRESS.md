@@ -79,25 +79,65 @@ Val loss klesá stabilně. LR: 3.00e-04 → 2.96e-04. Zbývá 462 epoch z 500.
 
 | Výstup | Model | Hodnocení |
 |--------|-------|-----------|
-| `C:\SoundBanks\IthacaPlayer\generated\ks-grand\` | small, max_crop=50 | Bas nepřijatelný |
-| `C:\SoundBanks\IthacaPlayer\generated\ks-grand-q38\` | **medium, max_crop=200, ep 38** | K poslechu |
+| `C:\SoundBanks\IthacaPlayer\generated\ks-grand\` | small, max_crop=50 | Bas nepřijatelný — noise bomb, tmavý tunel |
+| `C:\SoundBanks\IthacaPlayer\generated\ks-grand-q38\` | **medium, max_crop=200, ep 38** | Bas hluboký ✓, ale přehnaný + šum across all notes |
 
 ---
 
-## Co dál
+## Perceptuální hodnocení ep 38 (9. dubna 2026)
 
-### Krátkodobě
-- Perceptuální hodnocení `ks-grand-q38` — fokus na bas m021–m039
-- Pokračování tréninku
+### Co se zlepšilo
+- **Bas má hloubku** — max_crop fix funguje. Předchozí model měl "tmavý tunel",
+  teď je reálná basová hloubka přítomna. Dvoustupňový decay se model naučil.
 
-### Střednědobě (seřazeno dle priority)
-1. **Per-partial frekvenčně závislý decay** — MLP predikuje d_k pro každý
-   partial zvlášť; fyzikální prior: d_k ∝ b₁ + b₃·k²
-2. **Beating / unison-spread** — druhá oscilátorová banka na F₀ + δF;
-   tiny FC (F0, velocity) → δF; téměř nulová výpočetní cena, velký dopad
-3. **NoiseSynth temporal gating** — šum jen v attack fázi (0–200 ms)
+### Přetrvávající problémy
 
-### Dlouhodobě
-- Large model (4.4M params) na GPU
-- Phantom partial modul pro C3 a níže
-- Export SFZ/Kontakt banky
+**1. Šum napříč celým rozsahem**
+
+Příčina: NoiseSynth stále funguje jako záchranná síť — všude kde harmonická
+syntéza není jistá, přidá šum. Ep 38 z 500 je příliš brzo. Druhá příčina:
+chybí **NoiseSynth temporal gating** — šum se přidává po celou dobu tónu,
+i v sustain fázi kde fyzikálně nepatří. Soundboard shock decay je rychlý,
+trvá ~200 ms, pak by mělo být ticho (nebo jen harmonické).
+
+**2. Bas příliš akcentovaný / mohutný**
+
+Pravděpodobné příčiny:
+- Dvoustupňový decay σ_slow je v basu příliš silný — model přehnal pomalou složku
+- MRSTFT FFT=16384 nutí model agresivně posilovat každou basovou harmonickou
+- NoiseSynth přidává nízko frekvenční šum na vrch harmonické složky
+
+**Okamžitý workaround:** generovat s `--decay-scale 0.7` ztlumí fyzikální decay.
+
+---
+
+## Závěry a priority pro další vývoj
+
+### Co víme jistě
+1. `max_crop=200` (1.07 s) je správná cesta — bas získal hloubku
+2. Šum bude klesat s dalšími epochami — trénink je na 38/500
+3. NoiseSynth temporal gating je **akutní priorita** — bez něj bude šum
+   přetrvávat bez ohledu na počet epoch
+
+### Co dál (seřazeno dle priority)
+
+1. **Nechat dotrénovat** — konvergence je aktivní, zbývá 462 epoch.
+   Harmonická větev bude jistější → NoiseSynth ustoupí přirozeně.
+
+2. **NoiseSynth temporal gating** *(střední obtížnost, vysoký dopad)*
+   Šum jen v attack fázi (0–200 ms), po té pouze harmonické.
+   Implementace: přidat note-age jako kondicionovací vstup NoiseSynthu.
+
+3. **Beating / unison-spread** *(nízká obtížnost, vysoký dopad)*
+   Druhá oscilátorová banka na F₀ + δF. Tiny FC (F0, velocity) → δF.
+   Dá basu "živost" místo statického sustain. Téměř nulová výpočetní cena.
+
+4. **Per-partial frekvenčně závislý decay** *(střední obtížnost)*
+   MLP predikuje d_k pro každý partial zvlášť.
+   Fyzikální prior: d_k ∝ b₁ + b₃·k² (vyšší parciály utichají rychleji).
+
+5. **Large model na GPU** *(až bude přístup k M5 nebo CUDA)*
+   4.4M params, adaptive max_crop, 1000 epoch = produkční kvalita.
+
+6. **Phantom partial modul** *(vysoká obtížnost, jen pro C3 a níže)*
+   Sekundární additive bank na f_m + f_n, |f_m − f_n|.
